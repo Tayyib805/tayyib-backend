@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+supabase
+python-dotenv
+httpx
+anthropic
+pydantic
+pydantic-settings
+resend
