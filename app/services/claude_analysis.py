@@ -1,4 +1,4 @@
-"""Ingredient analysis using Anthropic Claude."""
+"""Ingredient and label analysis using Anthropic Claude."""
 
 import json
 import logging
@@ -113,3 +113,50 @@ Return ONLY this JSON with no other text:
             "confidence": "low",
             "flagged_ingredients": [],
         }
+
+
+async def extract_ingredients_from_image(
+    image_base64: str,
+    media_type: str = "image/jpeg",
+) -> dict:
+    """Extract ingredients from label photo using Claude vision."""
+
+    settings = get_settings()
+    client = AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
+
+    response = await client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=1000,
+        temperature=0,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": image_base64,
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": """Extract the complete ingredients list from this product label.
+
+Return ONLY this JSON, no markdown:
+{
+  "found": true or false,
+  "ingredients_text": "exact ingredients as written, or null if not found",
+  "product_name": "product name or null",
+  "brand": "brand name or null",
+  "confidence": "high/medium/low"
+}""",
+                    },
+                ],
+            }
+        ],
+    )
+
+    raw = response.content[0].text.strip()
+    return extract_json(raw)

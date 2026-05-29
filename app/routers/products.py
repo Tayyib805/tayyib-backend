@@ -1,13 +1,25 @@
-"""Product lookup, scan, and voting endpoints."""
+"""Product lookup, scan, label enrichment, and voting endpoints."""
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 from supabase import Client
 
 from app.database import get_current_user, get_supabase
-from app.services.claude_analysis import analyze_ingredients
+from app.services.claude_analysis import analyze_ingredients, extract_ingredients_from_image
 from app.services.openfoodfacts import lookup_barcode
 
 router = APIRouter()
+
+
+class LabelScanRequest(BaseModel):
+    """Payload for scanning an ingredients label image."""
+
+    image_base64: str
+    media_type: str = "image/jpeg"
+    barcode: str | None = None
+    product_name: str | None = None
+    brand: str | None = None
 
 
 def _fetch_product_with_ingredients(supabase: Client, column: str, value: str) -> dict | None:
@@ -23,55 +35,261 @@ def _fetch_product_with_ingredients(supabase: Client, column: str, value: str) -
     return response.data[0] if response.data else None
 
 
+def _fetch_product_by_name_brand(
+    supabase: Client,
+    product_name: str,
+    brand: str | None,
+) -> dict | None:
+    """Fetch a product by exact name and optional brand."""
+
+    query = supabase.table("products").select("*, product_ingredients(*, ingredients(*))").eq(
+        "name", product_name
+    )
+    if brand:
+        query = query.eq("brand", brand)
+    response = query.limit(1).execute()
+    return response.data[0] if response.data else None
+
+
+def _has_ingredients(product: dict | None) -> bool:
+    """Return whether a product has linked ingredients."""
+
+    return bool(product and product.get("product_ingredients"))
+
+
+def _increment_scan_count(supabase: Client, product: dict) -> dict:
+    """Increment scan_count for a product and return the updated product object."""
+
+    new_count = int(product.get("scan_count") or 0) + 1
+    supabase.table("products").update({"scan_count": new_count}).eq("id", product["id"]).execute()
+    product["scan_count"] = new_count
+    return product
+
+
+def _ingredient_payload(flagged: dict) -> dict:
+    """Build an ingredient row from a flagged ingredient result."""
+
+    return {
+        "name": flagged.get("name") or "Unknown ingredient",
+        "e_number": flagged.get("e_number"),
+        "default_status": flagged.get("status") or "uncertain",
+        "has_variants": (flagged.get("status") or "uncertain") == "uncertain",
+        "ruling_notes": flagged.get("reason"),
+        "education_card_content": flagged.get("reason"),
+    }
+
+
+def _save_flagged_ingredients(
+    supabase: Client,
+    product_id: str,
+    flagged_ingredients: list[dict],
+) -> None:
+    """Persist flagged ingredients and link them to the product."""
+
+    for flagged in flagged_ingredients:
+        name = flagged.get("name")
+        if not name:
+            continue
+
+        ingredient = (
+            supabase.table("ingredients")
+            .select("id")
+            .eq("name", name)
+            .limit(1)
+            .execute()
+        )
+        if ingredient.data:
+            ingredient_id = ingredient.data[0]["id"]
+        else:
+            created = supabase.table("ingredients").insert(_ingredient_payload(flagged)).execute()
+            if not created.data:
+                continue
+            ingredient_id = created.data[0]["id"]
+
+        existing_link = (
+            supabase.table("product_ingredients")
+            .select("id")
+            .eq("product_id", product_id)
+            .eq("ingredient_id", ingredient_id)
+            .limit(1)
+            .execute()
+        )
+        if existing_link.data:
+            continue
+
+        supabase.table("product_ingredients").insert(
+            {
+                "product_id": product_id,
+                "ingredient_id": ingredient_id,
+                "variant_risk": flagged.get("status") == "uncertain",
+                "notes": flagged.get("reason"),
+            }
+        ).execute()
+
+
+async def _analyze_and_enrich_product(
+    supabase: Client,
+    product: dict | None,
+    off_product: dict,
+    barcode: str,
+) -> dict:
+    """Analyze Open Food Facts ingredients and save the result to Supabase."""
+
+    known = supabase.table("ingredients").select("name,e_number,default_status").execute()
+    ingredients_text = off_product.get("ingredients_text", "")
+    analysis = await analyze_ingredients(ingredients_text, known.data or [])
+    updates = {
+        "name": off_product["name"],
+        "brand": off_product.get("brand"),
+        "image_url": off_product.get("image_url"),
+        "overall_status": analysis.get("overall_status", "uncertain"),
+        "confidence_level": analysis.get("confidence", "low"),
+        "ingredients_text": ingredients_text,
+        "data_source": "open_food_facts",
+    }
+
+    if product:
+        scan_count = int(product.get("scan_count") or 0) + 1
+        updates["scan_count"] = scan_count
+        updated = supabase.table("products").update(updates).eq("id", product["id"]).execute()
+        saved = updated.data[0] if updated.data else {**product, **updates}
+    else:
+        created = (
+            supabase.table("products")
+            .insert(
+                {
+                    "barcode": barcode,
+                    "verification_tier": 3,
+                    "scan_count": 1,
+                    **updates,
+                }
+            )
+            .execute()
+        )
+        if not created.data:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to create product.",
+            )
+        saved = created.data[0]
+
+    _save_flagged_ingredients(supabase, saved["id"], analysis.get("flagged_ingredients") or [])
+    enriched = _fetch_product_with_ingredients(supabase, "id", saved["id"]) or saved
+    enriched["analysis"] = analysis
+    enriched["source"] = "open_food_facts"
+    return enriched
+
+
 @router.get("/scan/{barcode}")
 async def scan_product(barcode: str, supabase: Client = Depends(get_supabase)) -> dict:
-    """Scan a barcode, retrieve or create its product record, and return analysis."""
+    """Scan a barcode, preferring Tayyib data before enriching from Open Food Facts."""
 
     existing = _fetch_product_with_ingredients(supabase, "barcode", barcode)
-    if existing:
-        new_count = int(existing.get("scan_count") or 0) + 1
-        supabase.table("products").update({"scan_count": new_count}).eq(
-            "id", existing["id"]
-        ).execute()
-        existing["scan_count"] = new_count
-        return existing
+    if existing and _has_ingredients(existing):
+        return _increment_scan_count(supabase, existing)
 
     off_product = await lookup_barcode(barcode)
     if not off_product.get("found"):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found.")
-
-    known = supabase.table("ingredients").select("name,e_number,default_status").execute()
-    analysis = await analyze_ingredients(
-        off_product.get("ingredients_text", ""),
-        known.data or [],
-    )
-
-    created = (
-        supabase.table("products")
-        .insert(
-            {
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={
+                "found": False,
                 "barcode": barcode,
-                "name": off_product["name"],
-                "brand": off_product.get("brand"),
-                "image_url": off_product.get("image_url"),
-                "verification_tier": 3,
-                "scan_count": 1,
-                "overall_status": analysis.get("overall_status", "uncertain"),
-                "confidence_level": analysis.get("confidence", "low"),
-            }
-        )
-        .execute()
-    )
-    if not created.data:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to create product.",
+                "message": "Product not in database. Please scan the ingredients label.",
+                "requires_label_scan": True,
+            },
         )
 
-    product = created.data[0]
-    product["analysis"] = analysis
-    product["ingredients_text"] = off_product.get("ingredients_text", "")
-    return product
+    return await _analyze_and_enrich_product(supabase, existing, off_product, barcode)
+
+
+@router.post("/scan/label")
+async def scan_product_label(
+    payload: LabelScanRequest,
+    supabase: Client = Depends(get_supabase),
+) -> dict:
+    """Scan an ingredients label image and permanently enrich the product database."""
+
+    extraction = await extract_ingredients_from_image(payload.image_base64, payload.media_type)
+    if not extraction.get("found") or not extraction.get("ingredients_text"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No ingredients list visible. Please photograph the ingredients label directly.",
+        )
+
+    product_name = payload.product_name or extraction.get("product_name")
+    brand = payload.brand or extraction.get("brand")
+    if not product_name:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Product name is required when it cannot be extracted from the label.",
+        )
+
+    ingredients_text = extraction["ingredients_text"]
+    known = supabase.table("ingredients").select("name,e_number,default_status").execute()
+    analysis = await analyze_ingredients(ingredients_text, known.data or [])
+
+    existing = None
+    if payload.barcode:
+        existing = _fetch_product_with_ingredients(supabase, "barcode", payload.barcode)
+    if not existing:
+        existing = _fetch_product_by_name_brand(supabase, product_name, brand)
+
+    product_payload = {
+        "name": product_name,
+        "brand": brand,
+        "barcode": payload.barcode,
+        "overall_status": analysis.get("overall_status", "uncertain"),
+        "confidence_level": analysis.get("confidence", "low"),
+        "verification_tier": 3,
+        "data_source": "label_scan",
+        "ingredients_text": ingredients_text,
+    }
+
+    first_scan = existing is None
+    if existing:
+        update_payload = {key: value for key, value in product_payload.items() if value is not None}
+        update_payload["scan_count"] = int(existing.get("scan_count") or 0) + 1
+        updated = (
+            supabase.table("products")
+            .update(update_payload)
+            .eq("id", existing["id"])
+            .execute()
+        )
+        product = updated.data[0] if updated.data else {**existing, **update_payload}
+    else:
+        created = (
+            supabase.table("products")
+            .insert(
+                {
+                    **{key: value for key, value in product_payload.items() if value is not None},
+                    "scan_count": 1,
+                }
+            )
+            .execute()
+        )
+        if not created.data:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to create product.",
+            )
+        product = created.data[0]
+
+    _save_flagged_ingredients(supabase, product["id"], analysis.get("flagged_ingredients") or [])
+    supabase.table("label_scans").insert(
+        {
+            "product_id": product["id"],
+            "extracted_ingredients": ingredients_text,
+            "extraction_confidence": extraction.get("confidence") or "low",
+        }
+    ).execute()
+
+    enriched = _fetch_product_with_ingredients(supabase, "id", product["id"]) or product
+    enriched["analysis"] = analysis
+    enriched["extraction"] = extraction
+    enriched["source"] = "label_scan"
+    enriched["first_scan"] = first_scan
+    return enriched
 
 
 @router.get("/{product_id}")
