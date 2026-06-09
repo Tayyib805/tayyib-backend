@@ -176,18 +176,20 @@ def _ingredient_payload(flagged: dict) -> dict:
     }
 
 
-def _save_flagged_ingredients(
-    supabase: Client,
-    product_id: str,
-    flagged_ingredients: list[dict],
-) -> None:
-    """Persist flagged ingredients and link them to the product."""
+def _normalize_confidence(confidence: str | None) -> str:
+    """Return a valid confidence value."""
 
-    for flagged in flagged_ingredients:
-        name = flagged.get("name")
-        if not name:
-            continue
+    normalized = (confidence or "low").lower()
+    return normalized if normalized in {"high", "medium", "low"} else "low"
 
+
+def _find_ingredient_id(supabase: Client, flagged: dict) -> str | None:
+    """Find an ingredient by name or e_number."""
+
+    name = str(flagged.get("name") or "").strip()
+    e_number = str(flagged.get("e_number") or "").strip()
+
+    if name:
         ingredient = (
             supabase.table("ingredients")
             .select("id")
@@ -196,12 +198,73 @@ def _save_flagged_ingredients(
             .execute()
         )
         if ingredient.data:
-            ingredient_id = ingredient.data[0]["id"]
-        else:
-            created = supabase.table("ingredients").insert(_ingredient_payload(flagged)).execute()
-            if not created.data:
-                continue
-            ingredient_id = created.data[0]["id"]
+            return ingredient.data[0]["id"]
+
+    if e_number:
+        ingredient = (
+            supabase.table("ingredients")
+            .select("id")
+            .eq("e_number", e_number)
+            .limit(1)
+            .execute()
+        )
+        if ingredient.data:
+            return ingredient.data[0]["id"]
+
+    return None
+
+
+def _get_or_create_ingredient_id(supabase: Client, flagged: dict) -> str | None:
+    """Return an ingredient id, creating the ingredient if needed."""
+
+    ingredient_id = _find_ingredient_id(supabase, flagged)
+    if ingredient_id:
+        return ingredient_id
+
+    created = supabase.table("ingredients").insert(_ingredient_payload(flagged)).execute()
+    if not created.data:
+        return None
+    return created.data[0]["id"]
+
+
+def _product_ingredient_payload(
+    product_id: str,
+    ingredient_id: str,
+    flagged: dict,
+    confidence: str,
+) -> dict:
+    """Build a product_ingredients link payload from Claude analysis."""
+
+    flagged_status = flagged.get("status") or "uncertain"
+    reason = flagged.get("reason")
+    return {
+        "product_id": product_id,
+        "ingredient_id": ingredient_id,
+        "variant_risk": flagged_status == "uncertain",
+        "notes": reason,
+        "is_flagged": True,
+        "flag_reason": reason,
+        "confidence": confidence,
+    }
+
+
+def _save_flagged_ingredients(
+    supabase: Client,
+    product_id: str,
+    flagged_ingredients: list[dict],
+    confidence: str | None,
+) -> None:
+    """Persist flagged ingredients and link them to the product."""
+
+    normalized_confidence = _normalize_confidence(confidence)
+    for flagged in flagged_ingredients:
+        name = str(flagged.get("name") or "").strip()
+        if not name:
+            continue
+
+        ingredient_id = _get_or_create_ingredient_id(supabase, flagged)
+        if not ingredient_id:
+            continue
 
         existing_link = (
             supabase.table("product_ingredients")
@@ -211,17 +274,25 @@ def _save_flagged_ingredients(
             .limit(1)
             .execute()
         )
+        payload = _product_ingredient_payload(
+            product_id,
+            ingredient_id,
+            flagged,
+            normalized_confidence,
+        )
         if existing_link.data:
+            update_payload = {
+                key: value
+                for key, value in payload.items()
+                if key not in {"product_id", "ingredient_id"}
+            }
+            supabase.table("product_ingredients").update(update_payload).eq(
+                "id",
+                existing_link.data[0]["id"],
+            ).execute()
             continue
 
-        supabase.table("product_ingredients").insert(
-            {
-                "product_id": product_id,
-                "ingredient_id": ingredient_id,
-                "variant_risk": flagged.get("status") == "uncertain",
-                "notes": flagged.get("reason"),
-            }
-        ).execute()
+        supabase.table("product_ingredients").insert(payload).execute()
 
 
 async def _analyze_and_enrich_product(
@@ -279,7 +350,12 @@ async def _analyze_and_enrich_product(
         source_url=off_product.get("website"),
         data_source="open_food_facts",
     )
-    _save_flagged_ingredients(supabase, saved["id"], analysis.get("flagged_ingredients") or [])
+    _save_flagged_ingredients(
+        supabase,
+        saved["id"],
+        analysis.get("flagged_ingredients") or [],
+        analysis.get("confidence"),
+    )
     enriched = _fetch_product_with_ingredients(supabase, "id", saved["id"]) or saved
     enriched["analysis"] = analysis
     enriched["country_code"] = country_code
@@ -396,7 +472,12 @@ async def scan_product_label(
             )
         product = created.data[0]
 
-    _save_flagged_ingredients(supabase, product["id"], analysis.get("flagged_ingredients") or [])
+    _save_flagged_ingredients(
+        supabase,
+        product["id"],
+        analysis.get("flagged_ingredients") or [],
+        analysis.get("confidence"),
+    )
     formulation = _save_product_formulation(
         supabase,
         product["id"],
