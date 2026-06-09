@@ -19,6 +19,7 @@ async def create_scan(
 
     row = payload.model_dump()
     row["user_id"] = user["id"]
+    row["country_code"] = (row.get("country_code") or "US").strip().upper()
     response = supabase.table("scan_logs").insert(row).execute()
     if not response.data:
         raise HTTPException(

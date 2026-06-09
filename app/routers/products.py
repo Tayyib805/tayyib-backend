@@ -20,6 +20,7 @@ class LabelScanRequest(BaseModel):
     barcode: str | None = None
     product_name: str | None = None
     brand: str | None = None
+    country_code: str = "US"
 
 
 def _fetch_product_with_ingredients(supabase: Client, column: str, value: str) -> dict | None:
@@ -33,6 +34,51 @@ def _fetch_product_with_ingredients(supabase: Client, column: str, value: str) -
         .execute()
     )
     return response.data[0] if response.data else None
+
+
+def _normalize_country_code(country_code: str | None) -> str:
+    """Normalize a country code for formulation matching."""
+
+    return (country_code or "US").strip().upper() or "US"
+
+
+def _fetch_latest_formulation(
+    supabase: Client,
+    product_id: str,
+    country_code: str,
+) -> dict | None:
+    """Fetch the latest formulation for a product/country pair."""
+
+    response = (
+        supabase.table("product_formulations")
+        .select("*")
+        .eq("product_id", product_id)
+        .eq("country_code", country_code)
+        .order("effective_from", desc=True)
+        .limit(1)
+        .execute()
+    )
+    return response.data[0] if response.data else None
+
+
+def _fetch_product_by_barcode_country(
+    supabase: Client,
+    barcode: str,
+    country_code: str,
+) -> dict | None:
+    """Fetch a product by barcode and attach its country-specific formulation."""
+
+    product = _fetch_product_with_ingredients(supabase, "barcode", barcode)
+    if not product:
+        return None
+
+    product["product_formulation"] = _fetch_latest_formulation(
+        supabase,
+        product["id"],
+        country_code,
+    )
+    product["country_code"] = country_code
+    return product
 
 
 def _fetch_product_by_name_brand(
@@ -57,13 +103,64 @@ def _has_ingredients(product: dict | None) -> bool:
     return bool(product and product.get("product_ingredients"))
 
 
-def _increment_scan_count(supabase: Client, product: dict) -> dict:
+def _has_country_formulation(product: dict | None) -> bool:
+    """Return whether the product has an ingredients formulation for the country."""
+
+    formulation = product.get("product_formulation") if product else None
+    return bool(formulation and formulation.get("ingredients_text"))
+
+
+def _increment_scan_count(
+    supabase: Client,
+    product: dict,
+    country_code: str | None = None,
+) -> dict:
     """Increment scan_count for a product and return the updated product object."""
 
     new_count = int(product.get("scan_count") or 0) + 1
     supabase.table("products").update({"scan_count": new_count}).eq("id", product["id"]).execute()
     product["scan_count"] = new_count
+    if country_code:
+        product["country_code"] = country_code
     return product
+
+
+def _save_product_formulation(
+    supabase: Client,
+    product_id: str,
+    ingredients_text: str,
+    country_code: str,
+    source_url: str | None = None,
+    data_source: str = "open_food_facts",
+) -> dict | None:
+    """Save a country-specific product formulation."""
+
+    if not ingredients_text:
+        return None
+
+    existing = _fetch_latest_formulation(supabase, product_id, country_code)
+    payload = {
+        "product_id": product_id,
+        "ingredients_text": ingredients_text,
+        "source_url": source_url,
+        "country_code": country_code,
+        "data_source": data_source,
+    }
+    if existing:
+        updated = (
+            supabase.table("product_formulations")
+            .update({key: value for key, value in payload.items() if value is not None})
+            .eq("id", existing["id"])
+            .execute()
+        )
+        return updated.data[0] if updated.data else {**existing, **payload}
+
+    created = (
+        supabase.table("product_formulations")
+        .insert({key: value for key, value in payload.items() if value is not None})
+        .execute()
+    )
+    return created.data[0] if created.data else None
 
 
 def _ingredient_payload(flagged: dict) -> dict:
@@ -132,6 +229,7 @@ async def _analyze_and_enrich_product(
     product: dict | None,
     off_product: dict,
     barcode: str,
+    country_code: str,
 ) -> dict:
     """Analyze Open Food Facts ingredients and save the result to Supabase."""
 
@@ -173,34 +271,56 @@ async def _analyze_and_enrich_product(
             )
         saved = created.data[0]
 
+    formulation = _save_product_formulation(
+        supabase,
+        saved["id"],
+        ingredients_text,
+        country_code,
+        source_url=off_product.get("website"),
+        data_source="open_food_facts",
+    )
     _save_flagged_ingredients(supabase, saved["id"], analysis.get("flagged_ingredients") or [])
     enriched = _fetch_product_with_ingredients(supabase, "id", saved["id"]) or saved
     enriched["analysis"] = analysis
+    enriched["country_code"] = country_code
+    enriched["product_formulation"] = formulation
     enriched["source"] = "open_food_facts"
     return enriched
 
 
 @router.get("/scan/{barcode}")
-async def scan_product(barcode: str, supabase: Client = Depends(get_supabase)) -> dict:
+async def scan_product(
+    barcode: str,
+    country_code: str = "US",
+    supabase: Client = Depends(get_supabase),
+) -> dict:
     """Scan a barcode, preferring Tayyib data before enriching from Open Food Facts."""
 
-    existing = _fetch_product_with_ingredients(supabase, "barcode", barcode)
-    if existing and _has_ingredients(existing):
-        return _increment_scan_count(supabase, existing)
+    normalized_country = _normalize_country_code(country_code)
+    existing = _fetch_product_by_barcode_country(supabase, barcode, normalized_country)
+    if existing and _has_ingredients(existing) and _has_country_formulation(existing):
+        return _increment_scan_count(supabase, existing, normalized_country)
 
-    off_product = await lookup_barcode(barcode)
+    off_product = await lookup_barcode(barcode, normalized_country)
     if not off_product.get("found"):
         return JSONResponse(
             status_code=status.HTTP_404_NOT_FOUND,
             content={
                 "found": False,
                 "barcode": barcode,
+                "country_code": normalized_country,
                 "message": "Product not in database. Please scan the ingredients label.",
                 "requires_label_scan": True,
             },
         )
 
-    return await _analyze_and_enrich_product(supabase, existing, off_product, barcode)
+    return await _analyze_and_enrich_product(
+        supabase,
+        existing,
+        off_product,
+        barcode,
+        normalized_country,
+    )
 
 
 @router.post("/scan/label")
@@ -226,6 +346,7 @@ async def scan_product_label(
         )
 
     ingredients_text = extraction["ingredients_text"]
+    country_code = _normalize_country_code(payload.country_code)
     known = supabase.table("ingredients").select("name,e_number,default_status").execute()
     analysis = await analyze_ingredients(ingredients_text, known.data or [])
 
@@ -276,11 +397,19 @@ async def scan_product_label(
         product = created.data[0]
 
     _save_flagged_ingredients(supabase, product["id"], analysis.get("flagged_ingredients") or [])
+    formulation = _save_product_formulation(
+        supabase,
+        product["id"],
+        ingredients_text,
+        country_code,
+        data_source="label_scan",
+    )
     supabase.table("label_scans").insert(
         {
             "product_id": product["id"],
             "extracted_ingredients": ingredients_text,
             "extraction_confidence": extraction.get("confidence") or "low",
+            "country_code": country_code,
         }
     ).execute()
 
@@ -289,6 +418,8 @@ async def scan_product_label(
     enriched["extraction"] = extraction
     enriched["source"] = "label_scan"
     enriched["first_scan"] = first_scan
+    enriched["country_code"] = country_code
+    enriched["product_formulation"] = formulation
     return enriched
 
 

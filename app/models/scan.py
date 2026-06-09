@@ -9,3 +9,4 @@ class ScanCreate(BaseModel):
     product_id: str
     result_shown: str | None = None
     tier_at_time_of_scan: int | None = None
+    country_code: str | None = None
