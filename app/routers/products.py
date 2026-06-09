@@ -97,6 +97,100 @@ def _fetch_product_by_name_brand(
     return response.data[0] if response.data else None
 
 
+def _fetch_latest_analysis_flagged_ingredients(
+    supabase: Client,
+    product_id: str,
+) -> list[dict]:
+    """Fetch flagged ingredients from the latest stored analysis run."""
+
+    response = (
+        supabase.table("analysis_runs")
+        .select("result")
+        .eq("product_id", product_id)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    if not response.data:
+        return []
+
+    result = response.data[0].get("result") or {}
+    if not isinstance(result, dict):
+        return []
+    flagged = result.get("flagged_ingredients") or []
+    return flagged if isinstance(flagged, list) else []
+
+
+def _fetch_product_ingredient_flags(
+    supabase: Client,
+    product_id: str,
+) -> list[dict]:
+    """Fetch flagged ingredients from product_ingredients links."""
+
+    response = (
+        supabase.table("product_ingredients")
+        .select("flag_reason,notes,ingredients(name,e_number,default_status)")
+        .eq("product_id", product_id)
+        .eq("is_flagged", True)
+        .execute()
+    )
+
+    flagged = []
+    for link in response.data or []:
+        ingredient = link.get("ingredients") or {}
+        name = ingredient.get("name")
+        if not name:
+            continue
+        flagged.append(
+            {
+                "name": name,
+                "status": ingredient.get("default_status") or "uncertain",
+                "reason": link.get("flag_reason") or link.get("notes"),
+                "e_number": ingredient.get("e_number"),
+            }
+        )
+    return flagged
+
+
+def _format_flagged_ingredient(flagged: dict) -> dict:
+    """Format a flagged ingredient for scan responses."""
+
+    return {
+        "name": flagged.get("name"),
+        "status": flagged.get("status") or "uncertain",
+        "reason": flagged.get("reason"),
+        "e_number": flagged.get("e_number"),
+    }
+
+
+def _build_scan_response(
+    supabase: Client,
+    product: dict,
+    country_code: str,
+) -> dict:
+    """Build the public scan response payload."""
+
+    flagged_ingredients = _fetch_latest_analysis_flagged_ingredients(supabase, product["id"])
+    if not flagged_ingredients:
+        flagged_ingredients = _fetch_product_ingredient_flags(supabase, product["id"])
+
+    return {
+        "id": product["id"],
+        "name": product["name"],
+        "brand": product.get("brand"),
+        "overall_status": product.get("overall_status") or "uncertain",
+        "confidence_level": product.get("confidence_level") or "low",
+        "flagged_ingredients": [
+            _format_flagged_ingredient(flagged)
+            for flagged in flagged_ingredients
+            if flagged.get("name")
+        ],
+        "tier": product.get("verification_tier"),
+        "scan_count": product.get("scan_count") or 0,
+        "country_code": country_code,
+    }
+
+
 def _has_ingredients(product: dict | None) -> bool:
     """Return whether a product has linked ingredients."""
 
@@ -357,11 +451,9 @@ async def _analyze_and_enrich_product(
         analysis.get("confidence"),
     )
     enriched = _fetch_product_with_ingredients(supabase, "id", saved["id"]) or saved
-    enriched["analysis"] = analysis
     enriched["country_code"] = country_code
     enriched["product_formulation"] = formulation
-    enriched["source"] = "open_food_facts"
-    return enriched
+    return _build_scan_response(supabase, enriched, country_code)
 
 
 @router.get("/scan/{barcode}")
@@ -375,7 +467,8 @@ async def scan_product(
     normalized_country = _normalize_country_code(country_code)
     existing = _fetch_product_by_barcode_country(supabase, barcode, normalized_country)
     if existing and _has_ingredients(existing) and _has_country_formulation(existing):
-        return _increment_scan_count(supabase, existing, normalized_country)
+        product = _increment_scan_count(supabase, existing, normalized_country)
+        return _build_scan_response(supabase, product, normalized_country)
 
     off_product = await lookup_barcode(barcode, normalized_country)
     if not off_product.get("found"):
@@ -495,13 +588,9 @@ async def scan_product_label(
     ).execute()
 
     enriched = _fetch_product_with_ingredients(supabase, "id", product["id"]) or product
-    enriched["analysis"] = analysis
-    enriched["extraction"] = extraction
-    enriched["source"] = "label_scan"
-    enriched["first_scan"] = first_scan
     enriched["country_code"] = country_code
     enriched["product_formulation"] = formulation
-    return enriched
+    return _build_scan_response(supabase, enriched, country_code)
 
 
 @router.get("/{product_id}")
