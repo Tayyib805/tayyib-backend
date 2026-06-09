@@ -86,7 +86,7 @@ Return ONLY this JSON with no other text:
     try:
         logging.info(f"Analyzing ingredients: {ingredients_text[:100]}...")
         response = await client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-5",
             max_tokens=1000,
             temperature=0,
             system=system_prompt,
@@ -125,7 +125,7 @@ async def extract_ingredients_from_image(
     client = AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
 
     response = await client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-sonnet-4-5",
         max_tokens=1000,
         temperature=0,
         messages=[

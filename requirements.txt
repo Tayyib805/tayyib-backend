@@ -3,6 +3,10 @@ uvicorn[standard]
 supabase
 python-dotenv
 httpx
+beautifulsoup4
+playwright
+truststore
+pypdf
 anthropic
 pydantic
 pydantic-settings

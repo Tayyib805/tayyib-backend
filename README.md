@@ -40,3 +40,23 @@ Authenticated endpoints expect:
 ```http
 Authorization: Bearer <supabase-user-jwt>
 ```
+
+## Scrapers
+
+Install the scraper browser dependency after installing Python packages:
+
+```bash
+python -m playwright install chromium
+```
+
+Apply `supabase/migrations/005_manufacturer_scrape_tables.sql` before saving scraped data.
+
+Usage:
+
+```bash
+cd scrapers
+python manufacturer_scraper.py --brand fritolay --dry-run
+python seed_from_scrape.py --brand fritolay --limit 50
+```
+
+`--dry-run` prints results without saving to Supabase. `--limit N` stops after N products for testing.
