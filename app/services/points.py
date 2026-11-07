@@ -29,6 +29,17 @@ def award_points(supabase: Client, user_id: str, amount: int) -> None:
         rows = supabase.table("user_profiles").select("points").eq("id", user_id).limit(1).execute().data
         current = int((rows[0].get("points") if rows else 0) or 0)
         supabase.table("user_profiles").upsert({"id": user_id, "points": current + amount}, on_conflict="id").execute()
+        from app.services.push import notify, unlocked_between
+
+        for _cid, name in unlocked_between(current, current + amount):
+            notify(
+                supabase,
+                [user_id],
+                f"You unlocked {name}!",
+                f"{name} wants to meet you. Say hi in Rewards.",
+                "/?open=rewards",
+                f"unlock-{_cid}",
+            )
     except Exception:
         # Points are a bonus; never fail the user's action over them.
         pass

@@ -11,6 +11,7 @@ from supabase import Client
 from app.database import get_current_user, get_supabase
 from app.services.claude_analysis import analyze_ingredients
 from app.services.trust import vote_counts, why_not_counted
+from app.services.push import notify, product_followers
 
 router = APIRouter()
 optional_bearer_scheme = HTTPBearer(auto_error=False)
@@ -463,4 +464,39 @@ async def resolve_refute(
     resolved = updated.data[0]
     if payload.status == "accepted":
         _apply_accepted_refute(supabase, {**refute, **resolved})
+    if payload.status in {"accepted", "rejected"}:
+        _notify_outcome(supabase, {**refute, **resolved})
     return resolved
+
+
+def _notify_outcome(supabase: Client, refute: dict) -> None:
+    """Tell the challenger and voters how a challenge ended; followers if the verdict changed."""
+
+    product = _fetch_product(supabase, refute["product_id"]) or {}
+    name = product.get("name") or "a product"
+    accepted = refute.get("status") == "accepted"
+    people = {refute.get("user_id")}
+    try:
+        votes = supabase.table("refute_votes").select("user_id").eq("refute_id", refute["id"]).execute().data or []
+        people.update(v["user_id"] for v in votes)
+    except Exception:
+        pass
+    url = f"/?product={refute['product_id']}"
+    notify(
+        supabase,
+        people,
+        "Challenge decided",
+        f"The challenge on {name} was {'accepted' if accepted else 'not accepted'} after review.",
+        url,
+        f"refute-{refute['id']}",
+    )
+    if accepted:
+        followers = product_followers(supabase, refute["product_id"]) - people
+        notify(
+            supabase,
+            followers,
+            f"{name} changed",
+            f"A product you saved is now marked {refute.get('proposed_status')} after review.",
+            url,
+            f"verdict-{refute['product_id']}",
+        )

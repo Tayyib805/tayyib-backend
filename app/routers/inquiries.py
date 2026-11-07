@@ -12,6 +12,7 @@ from app.services.claude_analysis import analyze_ingredients
 from app.services.email_service import send_inquiry_email
 from app.services.inquiry_generator import generate_inquiry_email
 from app.services.openfoodfacts import extract_domain, lookup_barcode
+from app.services.push import notify, product_followers
 
 router = APIRouter()
 
@@ -232,11 +233,16 @@ async def trigger_inquiry(
     until an admin approves it with POST /inquiries/admin/{inquiry_id}/approve.
     """
 
-    del user
-
     product = _fetch_product(supabase, product_id)
     if not product:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found.")
+    # Remember who asked, so they hear when the manufacturer answers.
+    try:
+        supabase.table("product_watchers").upsert(
+            {"product_id": product_id, "user_id": user["id"]}, on_conflict="product_id,user_id"
+        ).execute()
+    except Exception:
+        pass
 
     existing = _get_existing_inquiry(supabase, product_id)
     if existing:
@@ -547,6 +553,10 @@ async def log_manufacturer_response(
     """Admin only - log a manufacturer's response as evidence."""
 
     await _require_admin(user, supabase)
+    prior = (
+        supabase.table("manufacturer_inquiries").select("send_status").eq("id", inquiry_id).limit(1).execute().data
+        or [{}]
+    )[0].get("send_status")
 
     updates = {
         "response_body": payload.response_body,
@@ -569,6 +579,17 @@ async def log_manufacturer_response(
         )
 
     inquiry = response.data[0]
+    # Notify once, when the reply is first logged (not on later edits).
+    if inquiry.get("product_id") and prior != "responded":
+        summary = (payload.resolution_notes or "").strip()
+        notify(
+            supabase,
+            product_followers(supabase, inquiry["product_id"]),
+            f"Psst! {inquiry['brand_name']} answered",
+            f"About {inquiry['product_name']}: {summary}" if summary else f"They replied about {inquiry['product_name']}. Tap to see what they said.",
+            f"/?product={inquiry['product_id']}",
+            f"maker-{inquiry['id']}",
+        )
     if payload.resolved and inquiry.get("product_id"):
         product = (
             supabase.table("products")

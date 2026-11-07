@@ -16,6 +16,10 @@ class Settings(BaseSettings):
     OPEN_FOOD_FACTS_USER_AGENT: str = "tayyib/1.0"
     ENVIRONMENT: str = "development"
     CORS_ORIGINS: str = "*"
+    # Phone notifications (web push). Leave empty to turn them off.
+    VAPID_PUBLIC_KEY: str = ""
+    VAPID_PRIVATE_KEY: str = ""
+    VAPID_SUBJECT: str = "mailto:verify@tayyib.app"
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 

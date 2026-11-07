@@ -11,3 +11,4 @@ anthropic
 pydantic
 pydantic-settings
 resend
+pywebpush
