@@ -164,6 +164,52 @@ def _update_product_challenge_counts(supabase: Client, product: dict) -> None:
     ).eq("id", product["id"]).execute()
 
 
+def _record_review_in_analysis(supabase: Client, refute: dict, proposed_status: str, ingredient_name: str) -> None:
+    """Add an analysis record reflecting the reviewed decision.
+
+    Scan results list flagged ingredients from the latest analysis record, so
+    without this an accepted challenge would change the verdict but leave the
+    ingredient shown with its old status.
+    """
+
+    try:
+        latest = (
+            supabase.table("analysis_runs")
+            .select("result,input_text,product_formulation_id")
+            .eq("product_id", refute["product_id"])
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        ).data
+        base = (latest[0] if latest else {}) or {}
+        result = dict(base.get("result") or {})
+        reason = refute.get("review_notes") or refute.get("reasoning")
+        flagged = [dict(f) for f in (result.get("flagged_ingredients") or []) if isinstance(f, dict)]
+        if ingredient_name:
+            hit = False
+            for item in flagged:
+                if (item.get("name") or "").strip().lower() == ingredient_name:
+                    item.update({"status": proposed_status, "reason": reason})
+                    hit = True
+            if not hit and proposed_status != "halal":
+                flagged.append({"name": refute.get("ingredient_name"), "status": proposed_status, "reason": reason, "e_number": None})
+        result.update({"overall_status": proposed_status, "flagged_ingredients": flagged, "reviewed": True})
+        supabase.table("analysis_runs").insert(
+            {
+                "product_id": refute["product_id"],
+                "product_formulation_id": base.get("product_formulation_id"),
+                "analysis_type": "ingredients_text",
+                "input_text": base.get("input_text"),
+                "result": result,
+                "overall_status": proposed_status,
+                "confidence_level": "high",
+                "data_source": "admin_entry",
+            }
+        ).execute()
+    except Exception:
+        pass
+
+
 def _apply_accepted_refute(supabase: Client, refute: dict) -> None:
     """Apply an accepted refute to product and linked ingredient status."""
 
@@ -172,11 +218,15 @@ def _apply_accepted_refute(supabase: Client, refute: dict) -> None:
     if proposed_status not in {"halal", "haram", "uncertain"} or not product_id:
         return
 
+    current = _fetch_product(supabase, product_id) or {}
+    # Reviewed by a person now, so automatic re-analysis must not replace it.
+    tier = min(int(current.get("verification_tier") or 3), 2)
     supabase.table("products").update(
-        {"overall_status": proposed_status, "updated_at": _now()}
+        {"overall_status": proposed_status, "verification_tier": tier, "analyzed_at": _now(), "updated_at": _now()}
     ).eq("id", product_id).execute()
 
     ingredient_name = (refute.get("ingredient_name") or "").strip().lower()
+    _record_review_in_analysis(supabase, refute, proposed_status, ingredient_name)
     if not ingredient_name:
         return
 
@@ -237,6 +287,8 @@ async def _reanalyze_for_refute(
     known = supabase.table("ingredients").select("name,e_number,default_status").execute()
     try:
         analysis = await analyze_ingredients(analysis_input, known.data or [])
+        if analysis.get("failed"):
+            raise RuntimeError(analysis.get("error"))
         analysis_status = analysis.get("overall_status") or "uncertain"
         note = (
             f"Reached {net} net community votes. Re-analysis with the challenge suggests "

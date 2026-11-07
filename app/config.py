@@ -12,6 +12,8 @@ class Settings(BaseSettings):
     SUPABASE_ANON_KEY: str
     SUPABASE_SERVICE_KEY: str
     ANTHROPIC_API_KEY: str
+    # Change on the server (no code change needed) if a model is retired.
+    ANTHROPIC_MODEL: str = "claude-sonnet-5-5"
     RESEND_API_KEY: str = ""
     OPEN_FOOD_FACTS_USER_AGENT: str = "tayyib/1.0"
     ENVIRONMENT: str = "development"

@@ -1,7 +1,9 @@
 """Product lookup, scan, label enrichment, and voting endpoints."""
 
+import logging
 import re
 import time
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import JSONResponse
@@ -9,7 +11,7 @@ from pydantic import BaseModel, Field
 from supabase import Client
 
 from app.database import get_current_user, get_supabase
-from app.services.claude_analysis import analyze_ingredients, extract_ingredients_from_image
+from app.services.claude_analysis import analyze_ingredients, describe_error, extract_ingredients_from_image
 from app.ratelimit import rate_limit
 from app.services.alternatives import build_alternatives, category_chain, category_label
 from app.services.openfoodfacts import lookup_barcode, normalize_product, search_halal_labeled
@@ -206,17 +208,81 @@ def _build_scan_response(
     }
 
 
-def _has_ingredients(product: dict | None) -> bool:
-    """Return whether a product has linked ingredients."""
-
-    return bool(product and product.get("product_ingredients"))
-
-
 def _has_country_formulation(product: dict | None) -> bool:
     """Return whether the product has an ingredients formulation for the country."""
 
     formulation = product.get("product_formulation") if product else None
     return bool(formulation and formulation.get("ingredients_text"))
+
+
+def _is_analyzed(product: dict | None) -> bool:
+    """True when the product's verdict came from a successful analysis."""
+
+    return bool(product and product.get("analyzed_at"))
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _analysis_unavailable(barcode: str | None = None, name: str | None = None) -> JSONResponse:
+    """Analysis couldn't run. Say so; never store or show a made-up verdict."""
+
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={
+            "found": True,
+            "analysis_unavailable": True,
+            "barcode": barcode,
+            "name": name,
+            "message": "We couldn't check the ingredients just now. Try again in a minute.",
+        },
+    )
+
+
+def _needs_label(barcode: str, country_code: str, name: str | None = None) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_404_NOT_FOUND,
+        content={
+            "found": False,
+            "barcode": barcode,
+            "name": name,
+            "country_code": country_code,
+            "message": "We don't have this product's ingredients yet. Please scan the ingredients label.",
+            "requires_label_scan": True,
+        },
+    )
+
+
+def _record_analysis(
+    supabase: Client,
+    product_id: str,
+    formulation: dict | None,
+    ingredients_text: str,
+    analysis: dict,
+    data_source: str,
+) -> None:
+    """Keep the analysis that produced the current verdict; scan results read the latest one."""
+
+    try:
+        supabase.table("analysis_runs").insert(
+            {
+                "product_id": product_id,
+                "product_formulation_id": (formulation or {}).get("id"),
+                "analysis_type": "ingredients_text",
+                "input_text": ingredients_text[:6000],
+                "result": {
+                    "overall_status": analysis.get("overall_status"),
+                    "confidence": analysis.get("confidence"),
+                    "flagged_ingredients": analysis.get("flagged_ingredients") or [],
+                },
+                "overall_status": analysis.get("overall_status"),
+                "confidence_level": _normalize_confidence(analysis.get("confidence")),
+                "data_source": data_source,
+            }
+        ).execute()
+    except Exception:
+        pass
 
 
 def _increment_scan_count(
@@ -418,9 +484,16 @@ async def _analyze_and_enrich_product(
     Open Food Facts record, so it can be re-checked later.
     """
 
-    known = supabase.table("ingredients").select("name,e_number,default_status").execute()
     ingredients_text = off_product.get("ingredients_text", "")
+    if not ingredients_text.strip():
+        return _needs_label(barcode, country_code, off_product.get("name"))
+    known = supabase.table("ingredients").select("name,e_number,default_status").execute()
     analysis = await analyze_ingredients(ingredients_text, known.data or [])
+    if analysis.get("failed"):
+        if product and _is_analyzed(product):
+            # Keep showing the last real verdict rather than nothing.
+            return _build_scan_response(supabase, _increment_scan_count(supabase, product, country_code), country_code)
+        return _analysis_unavailable(barcode, off_product.get("name"))
     updates = {
         "name": off_product["name"],
         "brand": off_product.get("brand"),
@@ -429,10 +502,17 @@ async def _analyze_and_enrich_product(
         "confidence_level": analysis.get("confidence", "low"),
         "ingredients_text": ingredients_text,
         "data_source": data_source,
+        "analyzed_at": _now_iso(),
     }
     if off_product.get("categories"):
         updates["categories"] = off_product["categories"]
         updates["primary_category"] = off_product.get("primary_category")
+    # A community-reviewed or scholar-verified verdict (tier 1-2) is never
+    # replaced by a fresh automatic analysis; only the formulation is saved.
+    protected = bool(product) and int(product.get("verification_tier") or 3) < 3
+    if protected:
+        for key in ("overall_status", "confidence_level", "analyzed_at"):
+            updates.pop(key, None)
 
     if product:
         scan_count = int(product.get("scan_count") or 0) + 1
@@ -467,12 +547,14 @@ async def _analyze_and_enrich_product(
         source_url=off_product.get("website"),
         data_source=data_source,
     )
-    _save_flagged_ingredients(
-        supabase,
-        saved["id"],
-        analysis.get("flagged_ingredients") or [],
-        analysis.get("confidence"),
-    )
+    if not protected:
+        _save_flagged_ingredients(
+            supabase,
+            saved["id"],
+            analysis.get("flagged_ingredients") or [],
+            analysis.get("confidence"),
+        )
+        _record_analysis(supabase, saved["id"], formulation, ingredients_text, analysis, data_source)
     enriched = _fetch_product_with_ingredients(supabase, "id", saved["id"]) or saved
     enriched["country_code"] = country_code
     enriched["product_formulation"] = formulation
@@ -497,7 +579,7 @@ async def scan_product(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid barcode.")
     normalized_country = _normalize_country_code(country_code)
     existing = _fetch_product_by_barcode_country(supabase, barcode, normalized_country)
-    if existing and _has_ingredients(existing) and _has_country_formulation(existing):
+    if existing and _is_analyzed(existing) and _has_country_formulation(existing):
         product = _increment_scan_count(supabase, existing, normalized_country)
         return _build_scan_response(supabase, product, normalized_country)
 
@@ -567,7 +649,7 @@ async def scan_from_device(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid barcode.")
     normalized_country = _normalize_country_code(payload.country_code)
     existing = _fetch_product_by_barcode_country(supabase, barcode, normalized_country)
-    if existing and _has_ingredients(existing) and _has_country_formulation(existing):
+    if existing and _is_analyzed(existing) and _has_country_formulation(existing):
         product = _increment_scan_count(supabase, existing, normalized_country)
         return _build_scan_response(supabase, product, normalized_country)
 
@@ -627,7 +709,16 @@ async def scan_product_label(
     if payload.barcode and not BARCODE_PATTERN.match(payload.barcode):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid barcode.")
 
-    extraction = await extract_ingredients_from_image(payload.image_base64, payload.media_type)
+    try:
+        extraction = await extract_ingredients_from_image(payload.image_base64, payload.media_type)
+    except Exception as exc:
+        logging.getLogger("tayyib.analysis").error("Label reading failed: %s", describe_error(exc))
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="We couldn't read labels just now. Try again in a minute.",
+        )
+    if not isinstance(extraction, dict):
+        extraction = {}
     if not extraction.get("found") or not extraction.get("ingredients_text"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -646,6 +737,11 @@ async def scan_product_label(
     country_code = _normalize_country_code(payload.country_code)
     known = supabase.table("ingredients").select("name,e_number,default_status").execute()
     analysis = await analyze_ingredients(ingredients_text, known.data or [])
+    if analysis.get("failed"):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="We read the label but couldn't check the ingredients just now. Try again in a minute.",
+        )
 
     existing = None
     if payload.barcode:
@@ -662,6 +758,7 @@ async def scan_product_label(
         "verification_tier": 3,
         "data_source": "label_scan",
         "ingredients_text": ingredients_text,
+        "analyzed_at": _now_iso(),
     }
 
     first_scan = existing is None
@@ -712,6 +809,8 @@ async def scan_product_label(
         country_code,
         data_source="label_scan",
     )
+    if not protected:
+        _record_analysis(supabase, product["id"], formulation, ingredients_text, analysis, "label_scan")
     earns = under_daily_cap(supabase, "label_scans", user["id"], DAILY_LABEL_AWARDS)
     supabase.table("label_scans").insert(
         {

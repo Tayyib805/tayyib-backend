@@ -1,8 +1,6 @@
 """Claude-powered manufacturer inquiry email generation."""
 
-import anthropic
-
-from app.config import get_settings
+from app.services.claude_analysis import create_message
 
 
 async def generate_inquiry_email(
@@ -13,14 +11,11 @@ async def generate_inquiry_email(
 ) -> str:
     """Generate professional halal ingredient inquiry email using Claude."""
 
-    settings = get_settings()
     ingredients_list = "\n".join(
         [f"- {ing['name']}: {ing['reason']}" for ing in flagged_ingredients]
     )
 
-    client = anthropic.AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
-    response = await client.messages.create(
-        model="claude-sonnet-4-20250514",
+    response = await create_message(
         max_tokens=700,
         temperature=0,
         system=(

@@ -1,5 +1,9 @@
 """FastAPI application entrypoint for the Tayyib API."""
 
+import asyncio
+import logging
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -7,8 +11,24 @@ from app.config import get_settings
 from app.routers import articles, ingredients, inquiries, products, push, refutes, restaurants, scans, users
 
 settings = get_settings()
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+for _noisy in ("httpx", "httpcore", "hpack", "urllib3"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Log whether ingredient analysis works, without delaying startup."""
+
+    from app.services.claude_analysis import self_check
+
+    task = asyncio.create_task(self_check())
+    yield
+    task.cancel()
+
 
 app = FastAPI(
+    lifespan=lifespan,
     title="Tayyib API",
     description="Halal food intelligence platform backend.",
     version="1.0.0",

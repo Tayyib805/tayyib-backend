@@ -1,4 +1,9 @@
-"""Ingredient and label analysis using Anthropic Claude."""
+"""Ingredient and label analysis using Anthropic Claude.
+
+When a call fails, `analyze_ingredients` returns {"failed": True, ...}
+instead of a verdict. Callers must never store a failed analysis as if it
+were a ruling; "uncertain" is a verdict, not an error state.
+"""
 
 import json
 import logging
@@ -6,6 +11,55 @@ import logging
 from anthropic import AsyncAnthropic
 
 from app.config import get_settings
+
+log = logging.getLogger("tayyib.analysis")
+VALID_STATUS = {"halal", "haram", "uncertain"}
+
+
+def model_name() -> str:
+    """The model in use; set ANTHROPIC_MODEL on the server to change it."""
+
+    return get_settings().ANTHROPIC_MODEL
+
+
+def _client() -> AsyncAnthropic:
+    return AsyncAnthropic(api_key=get_settings().ANTHROPIC_API_KEY)
+
+
+async def create_message(**kwargs):
+    """messages.create with the configured model.
+
+    Some models reject `temperature`; if so, retry once without it.
+    """
+
+    kwargs.setdefault("model", model_name())
+    client = _client()
+    try:
+        return await client.messages.create(**kwargs)
+    except Exception as exc:
+        if "temperature" in kwargs and "temperature" in str(exc).lower():
+            kwargs.pop("temperature")
+            return await client.messages.create(**kwargs)
+        raise
+
+
+def describe_error(exc: Exception) -> str:
+    """A short, key-free description of an API error for the logs."""
+
+    status = getattr(exc, "status_code", None)
+    return f"{type(exc).__name__}{f' {status}' if status else ''}: {str(exc)[:300]}"
+
+
+async def self_check() -> bool:
+    """Make one tiny call at startup so the logs show whether analysis works."""
+
+    try:
+        await create_message(max_tokens=5, messages=[{"role": "user", "content": "Reply with OK."}])
+        log.warning("Ingredient analysis ready (model %s).", model_name())
+        return True
+    except Exception as exc:
+        log.error("Ingredient analysis UNAVAILABLE (model %s): %s", model_name(), describe_error(exc))
+        return False
 
 
 def extract_json(text: str) -> dict:
@@ -23,15 +77,9 @@ def extract_json(text: str) -> dict:
 async def analyze_ingredients(ingredients_text: str, known_ingredients: list) -> dict:
     """Analyze ingredients for halal status and return a structured result."""
 
-    settings = get_settings()
-    if not ingredients_text:
-        return {
-            "overall_status": "uncertain",
-            "confidence": "low",
-            "flagged_ingredients": [],
-        }
+    if not ingredients_text or not ingredients_text.strip():
+        return {"failed": True, "error": "no ingredients", "flagged_ingredients": []}
 
-    client = AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
     system_prompt = """You are a halal food expert with deep knowledge of Islamic dietary law (fiqh). Analyze ingredient lists and identify halal status for each ingredient. You must flag ANY of these ingredients as uncertain or haram even if not in the known list:
 - Natural Flavors / Natural Flavouring
 - Artificial Flavors
@@ -88,35 +136,29 @@ Return ONLY this JSON with no other text:
 }}"""
 
     try:
-        logging.info(f"Analyzing ingredients: {ingredients_text[:100]}...")
-        response = await client.messages.create(
-            model="claude-sonnet-4-5",
-            max_tokens=1000,
+        response = await create_message(
+            max_tokens=1500,
             temperature=0,
             system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
         )
         raw_response = response.content[0].text
-        logging.info(f"Claude raw response: {raw_response}")
-        try:
-            result = extract_json(raw_response)
-        except json.JSONDecodeError as e:
-            logging.error(f"JSON parse error: {e}")
-            logging.error(f"Raw response was: {raw_response}")
-            return {
-                "overall_status": "uncertain",
-                "confidence": "low",
-                "flagged_ingredients": [],
-                "parse_error": str(e),
-            }
-        logging.info(f"Parsed result: {result}")
-        return result
-    except Exception:
-        return {
-            "overall_status": "uncertain",
-            "confidence": "low",
-            "flagged_ingredients": [],
-        }
+    except Exception as exc:
+        log.error("Ingredient analysis failed: %s", describe_error(exc))
+        return {"failed": True, "error": describe_error(exc), "flagged_ingredients": []}
+    try:
+        result = extract_json(raw_response)
+    except (json.JSONDecodeError, ValueError) as exc:
+        log.error("Ingredient analysis returned unreadable JSON: %s", str(exc)[:200])
+        return {"failed": True, "error": "unreadable response", "flagged_ingredients": []}
+    if not isinstance(result, dict) or result.get("overall_status") not in VALID_STATUS:
+        log.error("Ingredient analysis returned an unexpected shape.")
+        return {"failed": True, "error": "unexpected response", "flagged_ingredients": []}
+    flagged = result.get("flagged_ingredients")
+    result["flagged_ingredients"] = [f for f in flagged if isinstance(f, dict)] if isinstance(flagged, list) else []
+    if result.get("confidence") not in {"high", "medium", "low"}:
+        result["confidence"] = "low"
+    return result
 
 
 async def extract_ingredients_from_image(
@@ -125,12 +167,8 @@ async def extract_ingredients_from_image(
 ) -> dict:
     """Extract ingredients from label photo using Claude vision."""
 
-    settings = get_settings()
-    client = AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
-
-    response = await client.messages.create(
-        model="claude-sonnet-4-5",
-        max_tokens=1000,
+    response = await create_message(
+        max_tokens=1500,
         temperature=0,
         messages=[
             {
