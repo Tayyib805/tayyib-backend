@@ -1,8 +1,9 @@
 """Open Food Facts integration.
 
-Open Food Facts limits each IP to 15 product reads and 10 searches per minute.
-Every call from this API comes from one Render IP, so searches are cached and
-throttled here, and callers must treat "not available" as a normal result.
+Open Food Facts limits each IP to 15 product reads and 10 searches per minute,
+and going over can get the IP banned. Every call from this API comes from one
+Render IP, so reads and searches are budgeted here, misses are cached, and
+callers must treat "busy" and "not available" as normal results.
 """
 
 import time
@@ -21,6 +22,39 @@ _SEARCH_CACHE_MAX = 2_000
 _search_times: list[float] = []
 _search_cache: dict[tuple[str, str], tuple[float, list[dict]]] = {}
 _search_lock = Lock()
+
+# Product reads: published limit is 15/minute per IP, and going over risks a
+# ban of the server's only IP. Stay at 12 and hand the rest to the user's
+# device (Open Food Facts applies limits per user for app traffic).
+_PRODUCT_LIMIT_PER_MINUTE = 12
+_product_times: list[float] = []
+_product_lock = Lock()
+_backoff_until = 0.0
+# Barcodes Open Food Facts doesn't have, so repeat scans don't spend reads.
+_MISS_TTL_SECONDS = 6 * 60 * 60
+_MISS_MAX = 5_000
+_misses: dict[str, float] = {}
+
+
+def _take_product_slot() -> bool:
+    """Reserve one product read within the per-minute budget."""
+
+    now = time.monotonic()
+    with _product_lock:
+        if now < _backoff_until:
+            return False
+        while _product_times and now - _product_times[0] > 60:
+            _product_times.pop(0)
+        if len(_product_times) >= _PRODUCT_LIMIT_PER_MINUTE:
+            return False
+        _product_times.append(now)
+        return True
+
+
+def _back_off(seconds: float = 60) -> None:
+    global _backoff_until
+    with _product_lock:
+        _backoff_until = time.monotonic() + seconds
 
 
 def extract_domain(website: str) -> str | None:
@@ -64,43 +98,73 @@ def _categories(product: dict) -> tuple[list[str], str | None]:
     return tags, primary
 
 
-async def lookup_barcode(barcode: str, country_code: str = "US") -> dict:
-    """Look up a product by barcode in Open Food Facts."""
+def normalize_product(product: dict, barcode: str, country_code: str) -> dict:
+    """Turn an Open Food Facts product object into the shape the scan flow uses."""
 
-    normalized_country = (country_code or "US").strip().upper()
-    url = f"https://{_open_food_facts_host(normalized_country)}/api/v2/product/{barcode}.json"
-
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            response = await client.get(url, headers=_headers())
-        if response.status_code == 404:
-            return {"found": False, "barcode": barcode, "country_code": normalized_country}
-        response.raise_for_status()
-        payload = response.json()
-    except Exception:
-        return {"found": False, "barcode": barcode, "country_code": normalized_country}
-
-    if payload.get("status") != 1 or not payload.get("product"):
-        return {"found": False, "barcode": barcode, "country_code": normalized_country}
-
-    product = payload["product"]
     contact = product.get("contact") or {}
     contact_email = contact.get("email") if isinstance(contact, dict) else None
     categories, primary_category = _categories(product)
+
+    def text(key: str, limit: int) -> str | None:
+        value = product.get(key)
+        return value.strip()[:limit] if isinstance(value, str) and value.strip() else None
+
     return {
         "found": True,
-        "name": product.get("product_name") or product.get("generic_name") or "Unknown product",
-        "brand": product.get("brands"),
-        "ingredients_text": product.get("ingredients_text") or "",
-        "image_url": product.get("image_url"),
-        "website": product.get("link") or product.get("website") or None,
-        "contact_email": contact_email,
+        "name": text("product_name", 200) or text("generic_name", 200) or "Unknown product",
+        "brand": text("brands", 200),
+        "ingredients_text": text("ingredients_text", 5000) or "",
+        "image_url": text("image_url", 500),
+        "website": text("link", 500) or text("website", 500),
+        "contact_email": contact_email if isinstance(contact_email, str) else None,
         "barcode": barcode,
-        "country_code": normalized_country,
-        "categories": categories,
+        "country_code": country_code,
+        "categories": categories[:40],
         "primary_category": primary_category,
-        "labels": [tag for tag in product.get("labels_tags") or [] if isinstance(tag, str)],
+        "labels": [tag for tag in product.get("labels_tags") or [] if isinstance(tag, str)][:60],
     }
+
+
+async def lookup_barcode(barcode: str, country_code: str = "US") -> dict:
+    """Look up a product by barcode in Open Food Facts.
+
+    Returns {"found": False, "busy": True} when the read budget is spent or
+    Open Food Facts asks us to slow down; the app then looks it up itself.
+    """
+
+    normalized_country = (country_code or "US").strip().upper()
+    missing = {"found": False, "barcode": barcode, "country_code": normalized_country}
+    now = time.monotonic()
+    seen = _misses.get(barcode)
+    if seen and now - seen < _MISS_TTL_SECONDS:
+        return missing
+    if not _take_product_slot():
+        return {**missing, "busy": True}
+
+    url = f"https://{_open_food_facts_host(normalized_country)}/api/v2/product/{barcode}.json"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.get(url, headers=_headers())
+        if response.status_code in (429, 503):
+            _back_off(60)
+            return {**missing, "busy": True}
+        if response.status_code == 404:
+            payload = {}
+        else:
+            response.raise_for_status()
+            payload = response.json()
+    except httpx.TimeoutException:
+        return {**missing, "busy": True}
+    except Exception:
+        return missing
+
+    if payload.get("status") != 1 or not payload.get("product"):
+        if len(_misses) >= _MISS_MAX:
+            _misses.clear()
+        _misses[barcode] = now
+        return missing
+
+    return normalize_product(payload["product"], barcode, normalized_country)
 
 
 def _take_search_slot() -> bool:

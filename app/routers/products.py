@@ -5,14 +5,14 @@ import time
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from supabase import Client
 
 from app.database import get_current_user, get_supabase
 from app.services.claude_analysis import analyze_ingredients, extract_ingredients_from_image
 from app.ratelimit import rate_limit
 from app.services.alternatives import build_alternatives, category_chain, category_label
-from app.services.openfoodfacts import lookup_barcode, search_halal_labeled
+from app.services.openfoodfacts import lookup_barcode, normalize_product, search_halal_labeled
 from app.services.trust import vote_counts, why_not_counted
 from app.services.points import CONFIRM_RESULT, DAILY_LABEL_AWARDS, LABEL_PHOTO, award_points, under_daily_cap
 
@@ -410,8 +410,13 @@ async def _analyze_and_enrich_product(
     off_product: dict,
     barcode: str,
     country_code: str,
+    data_source: str = "open_food_facts",
 ) -> dict:
-    """Analyze Open Food Facts ingredients and save the result to Supabase."""
+    """Analyze Open Food Facts ingredients and save the result to Supabase.
+
+    data_source is "user_submission" when the user's device fetched the
+    Open Food Facts record, so it can be re-checked later.
+    """
 
     known = supabase.table("ingredients").select("name,e_number,default_status").execute()
     ingredients_text = off_product.get("ingredients_text", "")
@@ -423,7 +428,7 @@ async def _analyze_and_enrich_product(
         "overall_status": analysis.get("overall_status", "uncertain"),
         "confidence_level": analysis.get("confidence", "low"),
         "ingredients_text": ingredients_text,
-        "data_source": "open_food_facts",
+        "data_source": data_source,
     }
     if off_product.get("categories"):
         updates["categories"] = off_product["categories"]
@@ -460,7 +465,7 @@ async def _analyze_and_enrich_product(
         ingredients_text,
         country_code,
         source_url=off_product.get("website"),
-        data_source="open_food_facts",
+        data_source=data_source,
     )
     _save_flagged_ingredients(
         supabase,
@@ -497,6 +502,20 @@ async def scan_product(
         return _build_scan_response(supabase, product, normalized_country)
 
     off_product = await lookup_barcode(barcode, normalized_country)
+    if off_product.get("busy"):
+        # Our Open Food Facts budget is spent; the app fetches the record from
+        # the user's device and sends it to POST /scan/{barcode}/from-device.
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                "found": False,
+                "busy": True,
+                "client_lookup": True,
+                "barcode": barcode,
+                "country_code": normalized_country,
+                "message": "Product lookups are busy. Looking it up from your device instead.",
+            },
+        )
     if not off_product.get("found"):
         return JSONResponse(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -515,6 +534,66 @@ async def scan_product(
         off_product,
         barcode,
         normalized_country,
+    )
+
+
+class DeviceLookup(BaseModel):
+    """An Open Food Facts product record fetched by the user's device."""
+
+    country_code: str = "US"
+    product: dict = Field(default_factory=dict)
+
+
+@router.post(
+    "/scan/{barcode}/from-device",
+    dependencies=[
+        Depends(rate_limit("device_lookup_minute", 10, 60)),
+        Depends(rate_limit("device_lookup_day", 100, 86_400)),
+    ],
+)
+async def scan_from_device(
+    barcode: str,
+    payload: DeviceLookup,
+    supabase: Client = Depends(get_supabase),
+) -> dict:
+    """Analyze a product whose Open Food Facts record the app fetched itself.
+
+    Used only when our own lookups are busy. Records from devices are stored
+    as user submissions, never overwrite a product we already have for this
+    country, and are rate limited like scans.
+    """
+
+    if not BARCODE_PATTERN.match(barcode):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid barcode.")
+    normalized_country = _normalize_country_code(payload.country_code)
+    existing = _fetch_product_by_barcode_country(supabase, barcode, normalized_country)
+    if existing and _has_ingredients(existing) and _has_country_formulation(existing):
+        product = _increment_scan_count(supabase, existing, normalized_country)
+        return _build_scan_response(supabase, product, normalized_country)
+
+    record = payload.product or {}
+    code = str(record.get("code") or barcode).lstrip("0")
+    if code != barcode.lstrip("0"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="That record is for a different barcode.")
+    off_product = normalize_product(record, barcode, normalized_country)
+    if not off_product["ingredients_text"] or off_product["name"] == "Unknown product":
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={
+                "found": False,
+                "barcode": barcode,
+                "country_code": normalized_country,
+                "message": "Product not in database. Please scan the ingredients label.",
+                "requires_label_scan": True,
+            },
+        )
+    return await _analyze_and_enrich_product(
+        supabase,
+        existing,
+        off_product,
+        barcode,
+        normalized_country,
+        data_source="user_submission",
     )
 
 
