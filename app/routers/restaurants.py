@@ -85,7 +85,10 @@ async def create_restaurant(
     """Create a restaurant listing."""
 
     del user
-    response = supabase.table("restaurants").insert(payload.model_dump()).execute()
+    listing = payload.model_dump()
+    # Users can suggest a listing, but only an admin can mark it certified or halal.
+    listing["halal_status"] = "unverified"
+    response = supabase.table("restaurants").insert(listing).execute()
     if not response.data:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

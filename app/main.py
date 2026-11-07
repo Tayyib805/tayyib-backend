@@ -14,14 +14,16 @@ app = FastAPI(
     version="1.0.0",
 )
 
-if settings.ENVIRONMENT == "development":
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+# Auth uses Bearer tokens, not cookies, so credentials mode is not needed.
+# CORS_ORIGINS is a comma-separated allowlist; it defaults to "*" so the
+# Lovable preview keeps working. Set it to your real domains before launch.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[origin.strip() for origin in settings.CORS_ORIGINS.split(",") if origin.strip()],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
+)
 
 app.include_router(products.router, prefix="/products", tags=["products"])
 app.include_router(ingredients.router, prefix="/ingredients", tags=["ingredients"])

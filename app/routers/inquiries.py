@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from supabase import Client
 
 from app.database import get_current_user, get_supabase
+from app.ratelimit import rate_limit
 from app.services.claude_analysis import analyze_ingredients
 from app.services.email_service import send_inquiry_email
 from app.services.inquiry_generator import generate_inquiry_email
@@ -206,12 +207,22 @@ async def _require_admin(user: dict, supabase: Client) -> dict:
     return profile
 
 
-@router.post("/trigger/{product_id}")
+@router.post(
+    "/trigger/{product_id}",
+    dependencies=[Depends(rate_limit("inquiry_trigger", 5, 3_600))],
+)
 async def trigger_inquiry(
     product_id: str,
+    user: dict = Depends(get_current_user),
     supabase: Client = Depends(get_supabase),
 ) -> dict:
-    """Trigger inquiry for a product."""
+    """Draft a manufacturer inquiry for a product.
+
+    Drafts are never sent automatically. Every email waits in the admin queue
+    until an admin approves it with POST /inquiries/admin/{inquiry_id}/approve.
+    """
+
+    del user
 
     product = _fetch_product(supabase, product_id)
     if not product:
@@ -257,27 +268,22 @@ async def trigger_inquiry(
             detail="Failed to create inquiry.",
         )
 
-    inquiry = created.data[0]
     if manufacturer.get("contact_email"):
-        inquiry = await _send_and_update_inquiry(supabase, inquiry, manufacturer)
-        return {
-            "message": f"Inquiry sent to {manufacturer['contact_email']}",
-            "inquiry": inquiry,
-        }
-
-    return {
-        "message": f"Added to admin queue - email address needed for {brand_name}",
-        "inquiry": inquiry,
-    }
+        message = "Inquiry drafted and waiting for admin approval."
+    else:
+        message = f"Inquiry drafted - admin needs to add an email address for {brand_name}."
+    return {"message": message, "inquiry_id": created.data[0]["id"]}
 
 
 @router.get("/products/{product_id}")
 async def get_product_inquiries(
     product_id: str,
+    user: dict = Depends(get_current_user),
     supabase: Client = Depends(get_supabase),
 ) -> list[dict]:
-    """Get all inquiries for a product."""
+    """Admin only - get all inquiries for a product, including drafts and contacts."""
 
+    await _require_admin(user, supabase)
     response = (
         supabase.table("manufacturer_inquiries")
         .select("*, manufacturers(*)")
@@ -293,13 +299,13 @@ async def get_admin_queue(
     user: dict = Depends(get_current_user),
     supabase: Client = Depends(get_supabase),
 ) -> list[dict]:
-    """Admin only - get all inquiries pending email lookup."""
+    """Admin only - inquiries waiting for an email address or for send approval."""
 
     await _require_admin(user, supabase)
     response = (
         supabase.table("manufacturer_inquiries")
         .select("*, manufacturers(*)")
-        .eq("send_status", "pending_email")
+        .in_("send_status", ["pending_email", "pending_send"])
         .order("created_at", desc=True)
         .execute()
     )
@@ -312,7 +318,7 @@ async def set_manufacturer_email(
     user: dict = Depends(get_current_user),
     supabase: Client = Depends(get_supabase),
 ) -> dict:
-    """Admin sets manufacturer email and triggers pending inquiries."""
+    """Admin sets a manufacturer email. Pending drafts move to awaiting approval."""
 
     await _require_admin(user, supabase)
     manufacturer_response = (
@@ -335,37 +341,71 @@ async def set_manufacturer_email(
         )
     manufacturer = manufacturer_response.data[0]
 
-    pending = (
+    moved = (
         supabase.table("manufacturer_inquiries")
-        .select("*")
+        .update(
+            {
+                "recipient_email": manufacturer["contact_email"],
+                "send_status": "pending_send",
+                "updated_at": _now(),
+            }
+        )
         .eq("manufacturer_id", payload.manufacturer_id)
         .eq("send_status", "pending_email")
         .execute()
     )
 
-    sent_count = 0
-    failed_count = 0
-    for inquiry in pending.data or []:
-        updated = await _send_and_update_inquiry(supabase, inquiry, manufacturer)
-        if updated.get("send_status") == "sent":
-            sent_count += 1
-        else:
-            failed_count += 1
-
     return {
-        "message": "Manufacturer email updated.",
-        "inquiries_sent": sent_count,
-        "inquiries_failed": failed_count,
+        "message": "Manufacturer email updated. Drafts are ready for your approval.",
+        "inquiries_awaiting_approval": len(moved.data or []),
     }
+
+
+@router.post("/admin/{inquiry_id}/approve")
+async def approve_inquiry(
+    inquiry_id: str,
+    user: dict = Depends(get_current_user),
+    supabase: Client = Depends(get_supabase),
+) -> dict:
+    """Admin approves a drafted inquiry and sends it to the manufacturer."""
+
+    await _require_admin(user, supabase)
+    response = (
+        supabase.table("manufacturer_inquiries")
+        .select("*, manufacturers(*)")
+        .eq("id", inquiry_id)
+        .limit(1)
+        .execute()
+    )
+    inquiry = response.data[0] if response.data else None
+    if not inquiry:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Inquiry not found.")
+    if inquiry.get("send_status") not in {"pending_send", "failed"}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Inquiry is '{inquiry.get('send_status')}' and cannot be sent.",
+        )
+    manufacturer = inquiry.get("manufacturers") or {}
+    if not manufacturer.get("contact_email"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Add a manufacturer email before approving.",
+        )
+
+    inquiry.pop("manufacturers", None)
+    return await _send_and_update_inquiry(supabase, inquiry, manufacturer)
 
 
 @router.post("/{inquiry_id}/response")
 async def log_manufacturer_response(
     inquiry_id: str,
     payload: ManufacturerResponseRequest,
+    user: dict = Depends(get_current_user),
     supabase: Client = Depends(get_supabase),
 ) -> dict:
-    """Log manufacturer response."""
+    """Admin only - log a manufacturer's response as evidence."""
+
+    await _require_admin(user, supabase)
 
     updates = {
         "response_body": payload.response_body,

@@ -1,5 +1,7 @@
 """Product lookup, scan, label enrichment, and voting endpoints."""
 
+import re
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -7,9 +9,15 @@ from supabase import Client
 
 from app.database import get_current_user, get_supabase
 from app.services.claude_analysis import analyze_ingredients, extract_ingredients_from_image
+from app.ratelimit import rate_limit
 from app.services.openfoodfacts import lookup_barcode
 
 router = APIRouter()
+
+BARCODE_PATTERN = re.compile(r"^[A-Za-z0-9-]{4,32}$")
+ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+# Claude accepts images up to 5 MB; base64 inflates size by about 4/3.
+MAX_IMAGE_BASE64_CHARS = 7_000_000
 
 
 class LabelScanRequest(BaseModel):
@@ -456,7 +464,13 @@ async def _analyze_and_enrich_product(
     return _build_scan_response(supabase, enriched, country_code)
 
 
-@router.get("/scan/{barcode}")
+@router.get(
+    "/scan/{barcode}",
+    dependencies=[
+        Depends(rate_limit("scan_minute", 30, 60)),
+        Depends(rate_limit("scan_day", 500, 86_400)),
+    ],
+)
 async def scan_product(
     barcode: str,
     country_code: str = "US",
@@ -464,6 +478,8 @@ async def scan_product(
 ) -> dict:
     """Scan a barcode, preferring Tayyib data before enriching from Open Food Facts."""
 
+    if not BARCODE_PATTERN.match(barcode):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid barcode.")
     normalized_country = _normalize_country_code(country_code)
     existing = _fetch_product_by_barcode_country(supabase, barcode, normalized_country)
     if existing and _has_ingredients(existing) and _has_country_formulation(existing):
@@ -492,12 +508,35 @@ async def scan_product(
     )
 
 
-@router.post("/scan/label")
+@router.post(
+    "/scan/label",
+    dependencies=[
+        Depends(rate_limit("label_minute", 6, 60)),
+        Depends(rate_limit("label_day", 60, 86_400)),
+    ],
+)
 async def scan_product_label(
     payload: LabelScanRequest,
+    user: dict = Depends(get_current_user),
     supabase: Client = Depends(get_supabase),
 ) -> dict:
-    """Scan an ingredients label image and permanently enrich the product database."""
+    """Scan an ingredients label image and permanently enrich the product database.
+
+    Requires sign-in, because label scans write to the shared community database.
+    """
+
+    if payload.media_type not in ALLOWED_IMAGE_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Unsupported image type. Use JPEG, PNG, WebP, or GIF.",
+        )
+    if len(payload.image_base64) > MAX_IMAGE_BASE64_CHARS:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="Image is too large. Please use a photo under 5 MB.",
+        )
+    if payload.barcode and not BARCODE_PATTERN.match(payload.barcode):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid barcode.")
 
     extraction = await extract_ingredients_from_image(payload.image_base64, payload.media_type)
     if not extraction.get("found") or not extraction.get("ingredients_text"):
@@ -537,7 +576,12 @@ async def scan_product_label(
     }
 
     first_scan = existing is None
-    if existing:
+    # A label photo must never overwrite a community-reviewed or scholar-verified
+    # verdict. For those products the scan is recorded as a new formulation only.
+    protected = bool(existing) and int(existing.get("verification_tier") or 3) < 3
+    if protected:
+        product = existing
+    elif existing:
         update_payload = {key: value for key, value in product_payload.items() if value is not None}
         update_payload["scan_count"] = int(existing.get("scan_count") or 0) + 1
         updated = (
@@ -565,12 +609,13 @@ async def scan_product_label(
             )
         product = created.data[0]
 
-    _save_flagged_ingredients(
-        supabase,
-        product["id"],
-        analysis.get("flagged_ingredients") or [],
-        analysis.get("confidence"),
-    )
+    if not protected:
+        _save_flagged_ingredients(
+            supabase,
+            product["id"],
+            analysis.get("flagged_ingredients") or [],
+            analysis.get("confidence"),
+        )
     formulation = _save_product_formulation(
         supabase,
         product["id"],
@@ -581,6 +626,7 @@ async def scan_product_label(
     supabase.table("label_scans").insert(
         {
             "product_id": product["id"],
+            "user_id": user["id"],
             "extracted_ingredients": ingredients_text,
             "extraction_confidence": extraction.get("confidence") or "low",
             "country_code": country_code,
@@ -629,8 +675,10 @@ async def vote_to_elevate_product(
     vote_count = int(product.get("vote_count") or 0) + 1
     verification_tier = int(product.get("verification_tier") or 3)
     votes_needed = int(product.get("votes_needed_to_elevate") or 25)
-    if vote_count >= votes_needed and verification_tier > 1:
-        verification_tier -= 1
+    # Community votes can raise a product to Tier 2 (Community Reviewed) at most.
+    # Tier 1 (Scholar Verified) is only ever set by a scholar or admin.
+    if vote_count >= votes_needed and verification_tier > 2:
+        verification_tier = 2
 
     updated = (
         supabase.table("products")

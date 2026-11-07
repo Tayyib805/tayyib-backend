@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     RESEND_API_KEY: str = ""
     OPEN_FOOD_FACTS_USER_AGENT: str = "tayyib/1.0"
     ENVIRONMENT: str = "development"
+    CORS_ORIGINS: str = "*"
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
