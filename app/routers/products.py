@@ -733,6 +733,58 @@ async def scan_product_label(
     return response
 
 
+_surprising_cache: dict = {"at": 0.0, "data": None}
+
+
+@router.get("/surprising")
+async def surprising_products(supabase: Client = Depends(get_supabase)) -> dict:
+    """The community's most-scanned products whose verdict is haram or uncertain.
+
+    Everything comes from our own verdicts and the flagged ingredients behind
+    them; nothing is written in by hand. Cached for ten minutes.
+    """
+
+    now = time.monotonic()
+    if _surprising_cache["data"] and now - _surprising_cache["at"] < 600:
+        return _surprising_cache["data"]
+    rows = (
+        supabase.table("products")
+        .select("id,name,brand,image_url,overall_status,scan_count,verification_tier,product_ingredients(is_flagged,flag_reason,ingredients(name))")
+        .in_("overall_status", ["haram", "uncertain"])
+        .gte("scan_count", 2)
+        .order("scan_count", desc=True)
+        .limit(24)
+        .execute()
+    ).data or []
+    items = []
+    for row in rows:
+        flagged = [
+            link
+            for link in row.get("product_ingredients") or []
+            if link.get("is_flagged") and (link.get("ingredients") or {}).get("name")
+        ]
+        if not flagged:
+            continue  # only show verdicts we can explain
+        first = flagged[0]
+        items.append(
+            {
+                "id": row["id"],
+                "name": row["name"],
+                "brand": row.get("brand"),
+                "image_url": row.get("image_url"),
+                "status": row["overall_status"],
+                "scan_count": int(row.get("scan_count") or 0),
+                "tier": row.get("verification_tier"),
+                "because": first["ingredients"]["name"],
+                "because_detail": first.get("flag_reason"),
+                "flagged_count": len(flagged),
+            }
+        )
+    data = {"items": items[:12]}
+    _surprising_cache.update(at=now, data=data)
+    return data
+
+
 _stats_cache: dict = {"at": 0.0, "data": None}
 
 
@@ -862,6 +914,23 @@ async def get_halal_alternatives(
     )
     response["label_search"] = label_search
     return response
+
+
+@router.get("/{product_id}/verdict")
+async def get_product_verdict(
+    product_id: str,
+    country_code: str = "US",
+    supabase: Client = Depends(get_supabase),
+) -> dict:
+    """A stored product in the same shape a scan returns, for reopening results.
+
+    Read-only: unlike a scan it doesn't count as a scan or call Open Food Facts.
+    """
+
+    product = _fetch_product_with_ingredients(supabase, "id", product_id)
+    if not product:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found.")
+    return _build_scan_response(supabase, product, _normalize_country_code(country_code))
 
 
 @router.get("/{product_id}")

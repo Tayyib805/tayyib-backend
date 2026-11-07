@@ -2,7 +2,7 @@
 
 from datetime import UTC, datetime
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from supabase import Client
 
@@ -35,9 +35,10 @@ class SetManufacturerEmailRequest(BaseModel):
 class ManufacturerResponseRequest(BaseModel):
     """Payload for logging a manufacturer response."""
 
-    response_body: str
+    response_body: str = Field(min_length=1, max_length=20_000)
     resolved: bool
-    resolution_notes: str | None = None
+    # Shown publicly in the contact log, so write it for the community.
+    resolution_notes: str | None = Field(default=None, max_length=1_000)
 
 
 def _now() -> str:
@@ -282,6 +283,88 @@ async def trigger_inquiry(
     else:
         message = f"Inquiry drafted - admin needs to add an email address for {brand_name}."
     return {"message": message, "inquiry_id": created.data[0]["id"]}
+
+
+# ── Public contact log ──────────────────────────────────────────────────────
+# Only emails an admin approved and sent appear here. The manufacturer's raw
+# reply and addresses stay private (they can name people); the public sees
+# the admin's written summary of the answer.
+
+PUBLIC_FIELDS = "id,product_id,product_name,brand_name,flagged_ingredients,sent_at,send_status,response_received_at,resolved,resolution_notes"
+
+
+def _public(row: dict) -> dict:
+    asked = [
+        f.get("name")
+        for f in (row.get("flagged_ingredients") or [])
+        if isinstance(f, dict) and isinstance(f.get("name"), str)
+    ]
+    answered = row.get("send_status") == "responded"
+    return {
+        "id": row["id"],
+        "product_id": row.get("product_id"),
+        "product_name": row.get("product_name"),
+        "brand_name": row.get("brand_name"),
+        "asked_about": asked[:8],
+        "contacted_at": row.get("sent_at"),
+        "status": "answered" if answered else "awaiting_reply",
+        "answered_at": row.get("response_received_at") if answered else None,
+        "answer_summary": (row.get("resolution_notes") or None) if answered else None,
+    }
+
+
+@router.get("/public")
+async def public_contact_log(
+    limit: int = Query(default=30, ge=1, le=100),
+    supabase: Client = Depends(get_supabase),
+) -> dict:
+    """Manufacturers we've written to, newest first, and what they answered."""
+
+    rows = (
+        supabase.table("manufacturer_inquiries")
+        .select(PUBLIC_FIELDS)
+        .in_("send_status", ["sent", "responded"])
+        .order("sent_at", desc=True)
+        .limit(limit)
+        .execute()
+    ).data or []
+    return {"items": [_public(r) for r in rows]}
+
+
+@router.get("/public/products/{product_id}")
+async def public_product_contacts(
+    product_id: str,
+    supabase: Client = Depends(get_supabase),
+) -> dict:
+    """The public contact log for one product."""
+
+    rows = (
+        supabase.table("manufacturer_inquiries")
+        .select(PUBLIC_FIELDS)
+        .eq("product_id", product_id)
+        .in_("send_status", ["sent", "responded"])
+        .order("sent_at", desc=True)
+        .execute()
+    ).data or []
+    return {"items": [_public(r) for r in rows]}
+
+
+@router.get("/admin/sent")
+async def admin_sent(
+    user: dict = Depends(get_current_user),
+    supabase: Client = Depends(get_supabase),
+) -> list[dict]:
+    """Admin only - sent emails, so replies can be logged against them."""
+
+    await _require_admin(user, supabase)
+    return (
+        supabase.table("manufacturer_inquiries")
+        .select("*")
+        .in_("send_status", ["sent", "responded"])
+        .order("sent_at", desc=True)
+        .limit(100)
+        .execute()
+    ).data or []
 
 
 @router.get("/products/{product_id}")
