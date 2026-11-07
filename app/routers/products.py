@@ -648,7 +648,9 @@ async def scan_product_label(
     enriched = _fetch_product_with_ingredients(supabase, "id", product["id"]) or product
     enriched["country_code"] = country_code
     enriched["product_formulation"] = formulation
-    return _build_scan_response(supabase, enriched, country_code)
+    response = _build_scan_response(supabase, enriched, country_code)
+    response["points_awarded"] = LABEL_PHOTO if earns else 0
+    return response
 
 
 _stats_cache: dict = {"at": 0.0, "data": None}
@@ -831,4 +833,6 @@ async def vote_to_elevate_product(
         .eq("id", product_id)
         .execute()
     )
-    return updated.data[0] if updated.data else {"id": product_id}
+    result = dict(updated.data[0]) if updated.data else {"id": product_id}
+    result["points_awarded"] = CONFIRM_RESULT
+    return result
