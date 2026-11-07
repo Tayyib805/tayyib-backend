@@ -1,6 +1,7 @@
 """Product lookup, scan, label enrichment, and voting endpoints."""
 
 import logging
+import random
 import re
 import time
 from datetime import datetime, timezone
@@ -283,6 +284,29 @@ def _record_analysis(
         ).execute()
     except Exception:
         pass
+
+
+SPOT_CHECK_MIN = 0.05
+SPOT_CHECK_MAX = 0.10
+SPOT_CHECK_FULL_AGE_DAYS = 180
+
+
+def spot_check_chance(formulation: dict | None, now: datetime | None = None) -> float:
+    """How likely a cached scan is to ask for a label photo: 5% when just
+    verified, rising to 10% as the last check (or the record) ages."""
+
+    if not formulation or not formulation.get("ingredients_text"):
+        return 0.0
+    stamp = formulation.get("last_verified_at") or formulation.get("effective_from") or formulation.get("created_at")
+    age_days = SPOT_CHECK_FULL_AGE_DAYS
+    if stamp:
+        try:
+            then = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+            age_days = max(((now or datetime.now(timezone.utc)) - then).total_seconds() / 86400, 0)
+        except ValueError:
+            pass
+    share = min(age_days, SPOT_CHECK_FULL_AGE_DAYS) / SPOT_CHECK_FULL_AGE_DAYS
+    return round(SPOT_CHECK_MIN + (SPOT_CHECK_MAX - SPOT_CHECK_MIN) * share, 4)
 
 
 def _increment_scan_count(
@@ -581,7 +605,11 @@ async def scan_product(
     existing = _fetch_product_by_barcode_country(supabase, barcode, normalized_country)
     if existing and _is_analyzed(existing) and _has_country_formulation(existing):
         product = _increment_scan_count(supabase, existing, normalized_country)
-        return _build_scan_response(supabase, product, normalized_country)
+        response = _build_scan_response(supabase, product, normalized_country)
+        # Now and then, ask the person to photograph the label so we notice
+        # recipe changes. Answering needs sign-in; the app decides whether to ask.
+        response["spot_check"] = random.random() < spot_check_chance(existing.get("product_formulation"))
+        return response
 
     off_product = await lookup_barcode(barcode, normalized_country)
     if off_product.get("busy"):

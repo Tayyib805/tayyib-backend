@@ -8,7 +8,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
-from app.routers import articles, ingredients, inquiries, products, push, refutes, restaurants, scans, users
+from app.routers import articles, ingredients, inquiries, products, push, refutes, restaurants, scans, spotchecks, users
 
 settings = get_settings()
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -45,6 +45,7 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type"],
 )
 
+app.include_router(spotchecks.router, prefix="/products", tags=["spot checks"])
 app.include_router(products.router, prefix="/products", tags=["products"])
 app.include_router(ingredients.router, prefix="/ingredients", tags=["ingredients"])
 app.include_router(restaurants.router, prefix="/restaurants", tags=["restaurants"])
