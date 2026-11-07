@@ -3,7 +3,7 @@
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from supabase import Client
 
 from app.database import get_current_user, get_supabase
@@ -14,6 +14,15 @@ from app.services.inquiry_generator import generate_inquiry_email
 from app.services.openfoodfacts import extract_domain, lookup_barcode
 
 router = APIRouter()
+
+
+class EditInquiryRequest(BaseModel):
+    """Admin edits to a draft before approving it."""
+
+    email_body: str = Field(min_length=40, max_length=4000)
+
+
+UNSENT = ["pending_email", "pending_send", "failed"]
 
 
 class SetManufacturerEmailRequest(BaseModel):
@@ -299,13 +308,13 @@ async def get_admin_queue(
     user: dict = Depends(get_current_user),
     supabase: Client = Depends(get_supabase),
 ) -> list[dict]:
-    """Admin only - inquiries waiting for an email address or for send approval."""
+    """Admin only - drafts waiting for an email address, for approval, or to retry."""
 
     await _require_admin(user, supabase)
     response = (
         supabase.table("manufacturer_inquiries")
         .select("*, manufacturers(*)")
-        .in_("send_status", ["pending_email", "pending_send"])
+        .in_("send_status", UNSENT)
         .order("created_at", desc=True)
         .execute()
     )
@@ -359,6 +368,55 @@ async def set_manufacturer_email(
         "message": "Manufacturer email updated. Drafts are ready for your approval.",
         "inquiries_awaiting_approval": len(moved.data or []),
     }
+
+
+@router.patch("/admin/{inquiry_id}")
+async def edit_inquiry(
+    inquiry_id: str,
+    payload: EditInquiryRequest,
+    user: dict = Depends(get_current_user),
+    supabase: Client = Depends(get_supabase),
+) -> dict:
+    """Admin rewrites a draft before approving it. Sent emails can't be edited."""
+
+    await _require_admin(user, supabase)
+    updated = (
+        supabase.table("manufacturer_inquiries")
+        .update({"email_body": payload.email_body.strip(), "updated_at": _now()})
+        .eq("id", inquiry_id)
+        .in_("send_status", UNSENT)
+        .execute()
+    )
+    if not updated.data:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No unsent draft with that id.",
+        )
+    return updated.data[0]
+
+
+@router.delete("/admin/{inquiry_id}")
+async def discard_inquiry(
+    inquiry_id: str,
+    user: dict = Depends(get_current_user),
+    supabase: Client = Depends(get_supabase),
+) -> dict:
+    """Admin discards a draft. The product can be drafted again later."""
+
+    await _require_admin(user, supabase)
+    deleted = (
+        supabase.table("manufacturer_inquiries")
+        .delete()
+        .eq("id", inquiry_id)
+        .in_("send_status", UNSENT)
+        .execute()
+    )
+    if not deleted.data:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No unsent draft with that id.",
+        )
+    return {"discarded": True}
 
 
 @router.post("/admin/{inquiry_id}/approve")

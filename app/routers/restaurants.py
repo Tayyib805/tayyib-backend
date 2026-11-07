@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from supabase import Client
 
-from app.database import get_current_user, get_supabase
+from app.database import get_current_user, get_supabase, is_admin
 from app.models.restaurant import RestaurantCreate, RestaurantReviewCreate
 from app.ratelimit import rate_limit
 from app.services.overpass import fetch_halal_food
@@ -87,6 +87,110 @@ async def report_place(
         on_conflict="place_key,user_id",
     ).execute()
     return {"reported": True}
+
+
+# ── Admin review ─────────────────────────────────────────────────────────
+
+
+def _require_admin(user: dict, supabase: Client) -> None:
+    if not is_admin(user["id"], supabase):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required.")
+
+
+class SuggestionDecision(BaseModel):
+    decision: Literal["fully_halal", "halal_options", "reject"]
+
+
+class ClearReports(BaseModel):
+    place_key: str = Field(min_length=6, max_length=80)
+
+
+@router.get("/admin/review")
+async def admin_review(
+    user: dict = Depends(get_current_user),
+    supabase: Client = Depends(get_supabase),
+) -> dict:
+    """Suggested places waiting for review, and places the community has reported."""
+
+    _require_admin(user, supabase)
+    suggestions = (
+        supabase.table("restaurants")
+        .select("id,name,address,cuisine_type,lat,lng,phone,website,notes,created_at")
+        .eq("halal_status", "unverified")
+        .order("created_at", desc=True)
+        .limit(100)
+        .execute()
+    ).data or []
+    rows = (
+        supabase.table("place_reports")
+        .select("place_key,reason,note,created_at")
+        .order("created_at", desc=True)
+        .limit(1000)
+        .execute()
+    ).data or []
+    grouped: dict[str, dict] = {}
+    for r in rows:
+        g = grouped.setdefault(
+            r["place_key"],
+            {"place_key": r["place_key"], "total": 0, "reasons": {}, "notes": [], "latest": r["created_at"]},
+        )
+        g["total"] += 1
+        g["reasons"][r["reason"]] = g["reasons"].get(r["reason"], 0) + 1
+        if r.get("note") and len(g["notes"]) < 5:
+            g["notes"].append(r["note"])
+    hidden = {h["place_key"] for h in (supabase.table("hidden_places").select("place_key").execute().data or [])}
+    listing_ids = [k.split(":", 1)[1] for k in grouped if k.startswith("tayyib:")]
+    names = {}
+    if listing_ids:
+        names = {
+            row["id"]: row["name"]
+            for row in (supabase.table("restaurants").select("id,name").in_("id", listing_ids).execute().data or [])
+        }
+    reports = []
+    for key, g in grouped.items():
+        g["hidden"] = key in hidden
+        g["name"] = names.get(key.split(":", 1)[1]) if key.startswith("tayyib:") else None
+        reports.append(g)
+    reports.sort(key=lambda g: g["latest"], reverse=True)
+    reports.sort(key=lambda g: g["total"], reverse=True)
+    return {"suggestions": suggestions, "reports": reports}
+
+
+@router.post("/admin/suggestions/{restaurant_id}")
+async def decide_suggestion(
+    restaurant_id: str,
+    payload: SuggestionDecision,
+    user: dict = Depends(get_current_user),
+    supabase: Client = Depends(get_supabase),
+) -> dict:
+    """Publish a suggested place on the map, or reject (delete) it."""
+
+    _require_admin(user, supabase)
+    if payload.decision == "reject":
+        supabase.table("restaurants").delete().eq("id", restaurant_id).eq("halal_status", "unverified").execute()
+        return {"rejected": True}
+    updated = (
+        supabase.table("restaurants")
+        .update({"halal_status": payload.decision})
+        .eq("id", restaurant_id)
+        .execute()
+    )
+    if not updated.data:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Suggestion not found.")
+    return updated.data[0]
+
+
+@router.post("/admin/reports/clear")
+async def clear_reports(
+    payload: ClearReports,
+    user: dict = Depends(get_current_user),
+    supabase: Client = Depends(get_supabase),
+) -> dict:
+    """Dismiss the reports on a place, which puts it back on the map."""
+
+    _require_admin(user, supabase)
+    supabase.table("place_reports").delete().eq("place_key", payload.place_key).execute()
+    return {"cleared": True}
 
 
 @router.get("/{restaurant_id}")

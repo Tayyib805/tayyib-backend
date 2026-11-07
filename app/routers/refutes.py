@@ -10,6 +10,7 @@ from supabase import Client
 
 from app.database import get_current_user, get_supabase
 from app.services.claude_analysis import analyze_ingredients
+from app.services.trust import vote_counts, why_not_counted
 
 router = APIRouter()
 optional_bearer_scheme = HTTPBearer(auto_error=False)
@@ -200,17 +201,31 @@ def _apply_accepted_refute(supabase: Client, refute: dict) -> None:
         ).eq("id", link["id"]).execute()
 
 
+REVIEW_AT = 10
+REANALYZE_AT = 25
+
+
 async def _reanalyze_for_refute(
     supabase: Client,
     refute: dict,
     support_votes: int,
-) -> str:
-    """Run threshold re-analysis and return the next refute status."""
+    oppose_votes: int = 0,
+) -> tuple[str, str | None]:
+    """Run threshold re-analysis; return the next status and a note for the reviewer.
 
-    if support_votes < 25 or refute.get("status") in {"accepted", "rejected"}:
-        if support_votes >= 10 and refute.get("status") == "open":
-            return "under_review"
-        return refute.get("status") or "open"
+    Re-analysis never changes the product by itself. The challenge text goes
+    into the prompt, so a crafted challenge could steer it; an admin or scholar
+    accepts or rejects from the review queue instead.
+    """
+
+    net = support_votes - oppose_votes
+    current = refute.get("status") or "open"
+    if current in {"accepted", "rejected", "escalated_to_scholar"}:
+        return current, None
+    if net < REANALYZE_AT:
+        if net >= REVIEW_AT and current == "open":
+            return "under_review", None
+        return current, None
 
     product = _require_product(supabase, refute["product_id"])
     ingredients_text = product.get("ingredients_text") or _latest_formulation_text(
@@ -219,21 +234,17 @@ async def _reanalyze_for_refute(
     )
     analysis_input = f"{ingredients_text}\n\nCommunity challenge: {refute['reasoning']}"
     known = supabase.table("ingredients").select("name,e_number,default_status").execute()
-    analysis = await analyze_ingredients(analysis_input, known.data or [])
-    analysis_status = analysis.get("overall_status") or "uncertain"
-
-    if analysis_status != product.get("overall_status"):
-        supabase.table("products").update(
-            {
-                "overall_status": analysis_status,
-                "confidence_level": analysis.get("confidence", "low"),
-                "updated_at": _now(),
-            }
-        ).eq("id", product["id"]).execute()
-
-    if analysis_status == refute.get("proposed_status"):
-        return "accepted"
-    return "rejected"
+    try:
+        analysis = await analyze_ingredients(analysis_input, known.data or [])
+        analysis_status = analysis.get("overall_status") or "uncertain"
+        note = (
+            f"Reached {net} net community votes. Re-analysis with the challenge suggests "
+            f"{analysis_status} (confidence {analysis.get('confidence', 'low')}); the challenger "
+            f"proposed {refute.get('proposed_status')}. Product unchanged until reviewed."
+        )
+    except Exception:
+        note = f"Reached {net} net community votes. Re-analysis failed; review manually."
+    return "escalated_to_scholar", note
 
 
 @router.post("/products/{product_id}")
@@ -323,33 +334,42 @@ async def vote_on_refute(
 
     support_votes = int(refute.get("support_votes") or 0)
     oppose_votes = int(refute.get("oppose_votes") or 0)
+    counted = vote_counts(supabase, user)
+    if not counted:
+        return {
+            "refute_id": refute_id,
+            "support_votes": support_votes,
+            "oppose_votes": oppose_votes,
+            "status": refute.get("status") or "open",
+            "counted": False,
+            "message": why_not_counted(),
+        }
     if payload.vote_type == "support":
         support_votes += 1
     else:
         oppose_votes += 1
 
-    next_status = await _reanalyze_for_refute(supabase, refute, support_votes)
+    next_status, note = await _reanalyze_for_refute(supabase, refute, support_votes, oppose_votes)
     updates = {
         "support_votes": support_votes,
         "oppose_votes": oppose_votes,
         "status": next_status,
         "updated_at": _now(),
     }
+    if note:
+        updates["review_notes"] = note
     updated = (
         supabase.table("product_refutes")
         .update(updates)
         .eq("id", refute_id)
         .execute()
     )
-    updated_refute = updated.data[0] if updated.data else {**refute, **updates}
-    if next_status == "accepted":
-        _apply_accepted_refute(supabase, updated_refute)
-
     return {
         "refute_id": refute_id,
         "support_votes": support_votes,
         "oppose_votes": oppose_votes,
         "status": next_status,
+        "counted": True,
     }
 
 

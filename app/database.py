@@ -45,7 +45,8 @@ async def get_current_user(
             detail="Invalid authentication token.",
         )
 
-    return {"id": user.id, "email": user.email}
+    created = getattr(user, "created_at", None)
+    return {"id": user.id, "email": user.email, "created_at": str(created) if created else None}
 
 
 async def get_optional_user(

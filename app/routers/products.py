@@ -13,6 +13,7 @@ from app.services.claude_analysis import analyze_ingredients, extract_ingredient
 from app.ratelimit import rate_limit
 from app.services.alternatives import build_alternatives, category_chain, category_label
 from app.services.openfoodfacts import lookup_barcode, search_halal_labeled
+from app.services.trust import vote_counts, why_not_counted
 from app.services.points import CONFIRM_RESULT, DAILY_LABEL_AWARDS, LABEL_PHOTO, award_points, under_daily_cap
 
 router = APIRouter()
@@ -819,6 +820,10 @@ async def vote_to_elevate_product(
 
     award_points(supabase, user["id"], CONFIRM_RESULT)
 
+    if not vote_counts(supabase, user):
+        # Recorded (so it can't be repeated) but doesn't move the tier yet.
+        return {**product, "points_awarded": CONFIRM_RESULT, "counted": False, "message": why_not_counted()}
+
     vote_count = int(product.get("vote_count") or 0) + 1
     verification_tier = int(product.get("verification_tier") or 3)
     votes_needed = int(product.get("votes_needed_to_elevate") or 25)
@@ -835,4 +840,5 @@ async def vote_to_elevate_product(
     )
     result = dict(updated.data[0]) if updated.data else {"id": product_id}
     result["points_awarded"] = CONFIRM_RESULT
+    result["counted"] = True
     return result
