@@ -46,3 +46,31 @@ async def get_current_user(
         )
 
     return {"id": user.id, "email": user.email}
+
+
+async def get_optional_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+) -> dict[str, Any] | None:
+    """Return the signed-in user if a valid token is sent, otherwise None."""
+
+    if credentials is None:
+        return None
+    try:
+        user = supabase.auth.get_user(credentials.credentials).user
+    except Exception:
+        return None
+    return {"id": user.id, "email": user.email} if user else None
+
+
+def is_admin(user_id: str, client: Client | None = None) -> bool:
+    """True when the user's API profile has is_admin set."""
+
+    rows = (
+        (client or supabase)
+        .table("user_profiles")
+        .select("is_admin")
+        .eq("id", user_id)
+        .limit(1)
+        .execute()
+    ).data
+    return bool(rows and rows[0].get("is_admin"))
