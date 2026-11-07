@@ -4,10 +4,11 @@ from pydantic import BaseModel, Field
 
 
 class RestaurantCreate(BaseModel):
-    """Payload for creating a restaurant."""
+    """Payload for suggesting a restaurant. It stays unverified until reviewed."""
 
-    name: str
-    address: str | None = None
+    name: str = Field(min_length=2, max_length=120)
+    address: str | None = Field(default=None, max_length=200)
+    notes: str | None = Field(default=None, max_length=500)
     lat: float | None = None
     lng: float | None = None
     cuisine_type: str | None = None
