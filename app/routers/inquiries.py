@@ -10,7 +10,7 @@ from app.database import get_current_user, get_supabase
 from app.ratelimit import rate_limit
 from app.services.claude_analysis import analyze_ingredients
 from app.services.email_service import send_inquiry_email
-from app.services.inquiry_generator import generate_inquiry_email
+from app.services.inquiry_generator import fallback_inquiry_email, generate_inquiry_email
 from app.services.openfoodfacts import extract_domain, lookup_barcode
 from app.services.push import notify, product_followers
 
@@ -40,6 +40,10 @@ class ManufacturerResponseRequest(BaseModel):
     resolved: bool
     # Shown publicly in the contact log, so write it for the community.
     resolution_notes: str | None = Field(default=None, max_length=1_000)
+    # The official ingredient list, if they sent one. It confirms or replaces
+    # the list we hold for that country.
+    official_ingredients: str | None = Field(default=None, max_length=6_000)
+    country_code: str = Field(default="US", max_length=8)
 
 
 def _now() -> str:
@@ -218,6 +222,58 @@ async def _require_admin(user: dict, supabase: Client) -> dict:
     return profile
 
 
+async def _write_email(product: dict, brand_name: str, flagged: list, request_list: bool) -> str:
+    try:
+        return await generate_inquiry_email(
+            product_name=product["name"],
+            brand_name=brand_name,
+            barcode=product.get("barcode") or "",
+            flagged_ingredients=flagged,
+            request_ingredient_list=request_list,
+        )
+    except Exception:
+        return fallback_inquiry_email(product["name"], brand_name, product.get("barcode") or "", flagged, request_list)
+
+
+async def draft_ingredient_request(supabase: Client, product: dict, flagged: list) -> dict | None:
+    """Queue a draft asking the manufacturer for the official ingredient list.
+
+    Used when a product's ingredients come only from shoppers' label photos.
+    Never sends: it waits for an admin's approval like every other email. If
+    an unsent draft already exists it is marked to ask for the list instead.
+    """
+
+    existing = _get_existing_inquiry(supabase, product["id"])
+    if existing:
+        if existing.get("send_status") in UNSENT and not existing.get("request_ingredients"):
+            brand = existing.get("brand_name") or product.get("brand") or "Unknown brand"
+            body = await _write_email(product, brand, existing.get("flagged_ingredients") or flagged, True)
+            supabase.table("manufacturer_inquiries").update(
+                {"request_ingredients": True, "email_body": body, "updated_at": _now()}
+            ).eq("id", existing["id"]).execute()
+        return existing
+    brand_name = product.get("brand") or "Unknown brand"
+    manufacturer = _get_manufacturer(supabase, brand_name)
+    if not manufacturer:
+        manufacturer = await _create_manufacturer_from_off(supabase, product, brand_name)
+    body = await _write_email(product, brand_name, flagged, True)
+    created = supabase.table("manufacturer_inquiries").insert(
+        {
+            "product_id": product["id"],
+            "manufacturer_id": manufacturer["id"],
+            "brand_name": brand_name,
+            "product_name": product["name"],
+            "barcode": product.get("barcode") or "",
+            "flagged_ingredients": flagged,
+            "email_body": body,
+            "recipient_email": manufacturer.get("contact_email"),
+            "send_status": "pending_send" if manufacturer.get("contact_email") else "pending_email",
+            "request_ingredients": True,
+        }
+    ).execute()
+    return created.data[0] if created.data else None
+
+
 @router.post(
     "/trigger/{product_id}",
     dependencies=[Depends(rate_limit("inquiry_trigger", 5, 3_600))],
@@ -260,12 +316,7 @@ async def trigger_inquiry(
     if not manufacturer:
         manufacturer = await _create_manufacturer_from_off(supabase, product, brand_name)
 
-    email_body = await generate_inquiry_email(
-        product_name=product["name"],
-        brand_name=brand_name,
-        barcode=product.get("barcode") or "",
-        flagged_ingredients=flagged_ingredients,
-    )
+    email_body = await _write_email(product, brand_name, flagged_ingredients, False)
     create_payload = {
         "product_id": product_id,
         "manufacturer_id": manufacturer["id"],
@@ -589,6 +640,15 @@ async def log_manufacturer_response(
             f"About {inquiry['product_name']}: {summary}" if summary else f"They replied about {inquiry['product_name']}. Tap to see what they said.",
             f"/?product={inquiry['product_id']}",
             f"maker-{inquiry['id']}",
+        )
+    official = (payload.official_ingredients or "").strip()
+    if official and inquiry.get("product_id"):
+        from app.services.label_qc import apply_official_list
+
+        supabase.table("manufacturer_inquiries").update({"official_ingredients": official}).eq("id", inquiry_id).execute()
+        inquiry["official_ingredients"] = official
+        inquiry["ingredients_update"] = await apply_official_list(
+            supabase, inquiry["product_id"], payload.country_code, official
         )
     if payload.resolved and inquiry.get("product_id"):
         product = (

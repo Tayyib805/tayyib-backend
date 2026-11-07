@@ -17,6 +17,15 @@ from app.ratelimit import rate_limit
 from app.services.alternatives import build_alternatives, category_chain, category_label
 from app.services.openfoodfacts import lookup_barcode, normalize_product, search_halal_labeled
 from app.services.trust import vote_counts, why_not_counted
+from app.services.label_qc import (
+    CONFIRMATIONS_NEEDED,
+    formulations,
+    label_status,
+    outcome_message,
+    process_label,
+    record_photo,
+    request_official_list,
+)
 from app.services.points import CONFIRM_RESULT, DAILY_LABEL_AWARDS, LABEL_PHOTO, award_points, under_daily_cap
 
 router = APIRouter()
@@ -62,18 +71,10 @@ def _fetch_latest_formulation(
     product_id: str,
     country_code: str,
 ) -> dict | None:
-    """Fetch the latest formulation for a product/country pair."""
+    """The ingredient list a verdict is based on: the newest confirmed one,
+    or for a product known only from label photos, its newest photo reading."""
 
-    response = (
-        supabase.table("product_formulations")
-        .select("*")
-        .eq("product_id", product_id)
-        .eq("country_code", country_code)
-        .order("effective_from", desc=True)
-        .limit(1)
-        .execute()
-    )
-    return response.data[0] if response.data else None
+    return formulations(supabase, product_id, country_code)[0]
 
 
 def _fetch_product_by_barcode_country(
@@ -206,7 +207,15 @@ def _build_scan_response(
         "barcode": product.get("barcode"),
         "image_url": product.get("image_url"),
         "category": category_label(product.get("primary_category")),
+        "label_status": _safe_label_status(supabase, product, country_code),
     }
+
+
+def _safe_label_status(supabase: Client, product: dict, country_code: str) -> dict | None:
+    try:
+        return label_status(supabase, product, country_code)
+    except Exception:
+        return None
 
 
 def _has_country_formulation(product: dict | None) -> bool:
@@ -332,12 +341,18 @@ def _save_product_formulation(
     source_url: str | None = None,
     data_source: str = "open_food_facts",
 ) -> dict | None:
-    """Save a country-specific product formulation."""
+    """Save a country-specific product formulation.
+
+    Lists from trusted sources (Open Food Facts, manufacturers, admins) are
+    confirmed when stored. A list read from a label photo is stored
+    unconfirmed; see app/services/label_qc.py.
+    """
 
     if not ingredients_text:
         return None
 
     existing = _fetch_latest_formulation(supabase, product_id, country_code)
+    trusted = data_source != "label_scan"
     payload = {
         "product_id": product_id,
         "ingredients_text": ingredients_text,
@@ -345,10 +360,14 @@ def _save_product_formulation(
         "country_code": country_code,
         "data_source": data_source,
     }
-    if existing:
+    if trusted:
+        payload["confirmed_at"] = _now_iso()
+    # Update in place only a trusted record from the same kind of source;
+    # a photo reading is kept as its own record.
+    if existing and existing.get("confirmed_at") and trusted and existing.get("data_source") == data_source:
         updated = (
             supabase.table("product_formulations")
-            .update({key: value for key, value in payload.items() if value is not None})
+            .update({key: value for key, value in payload.items() if value is not None and key != "confirmed_at"})
             .eq("id", existing["id"])
             .execute()
         )
@@ -608,7 +627,9 @@ async def scan_product(
         response = _build_scan_response(supabase, product, normalized_country)
         # Now and then, ask the person to photograph the label so we notice
         # recipe changes. Answering needs sign-in; the app decides whether to ask.
-        response["spot_check"] = random.random() < spot_check_chance(existing.get("product_formulation"))
+        response["spot_check"] = not response.get("label_status") and random.random() < spot_check_chance(
+            existing.get("product_formulation")
+        )
         return response
 
     off_product = await lookup_barcode(barcode, normalized_country)
@@ -763,6 +784,36 @@ async def scan_product_label(
 
     ingredients_text = extraction["ingredients_text"]
     country_code = _normalize_country_code(payload.country_code)
+    confidence = _normalize_confidence(extraction.get("confidence"))
+
+    existing = None
+    if payload.barcode:
+        existing = _fetch_product_with_ingredients(supabase, "barcode", payload.barcode)
+    else:
+        existing = _fetch_product_by_name_brand(supabase, product_name, brand)
+
+    # We already hold ingredients for this product: the photo confirms them,
+    # confirms a reported change, or reports a new one. It never replaces
+    # what everyone sees on its own (see app/services/label_qc.py).
+    if existing and _fetch_latest_formulation(supabase, existing["id"], country_code):
+        outcome = await process_label(
+            supabase, product=existing, country=country_code, user_id=user["id"], text=ingredients_text, confidence=confidence
+        )
+        if outcome.get("unreadable"):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No ingredients list visible. Please photograph the ingredients label directly.")
+        earns = bool(outcome.get("first_time")) and under_daily_cap(supabase, "label_scans", user["id"], DAILY_LABEL_AWARDS + 1)
+        if earns:
+            award_points(supabase, user["id"], LABEL_PHOTO)
+        product = outcome.get("product") or _fetch_product_with_ingredients(supabase, "id", existing["id"]) or existing
+        product["country_code"] = country_code
+        response = _build_scan_response(supabase, product, country_code)
+        response["label_result"] = {k: v for k, v in outcome.items() if k != "product"}
+        response["label_result"]["message"] = outcome_message(outcome)
+        response["points_awarded"] = LABEL_PHOTO if earns else 0
+        return response
+
+    # New to us. The shopper gets a verdict now; everyone sees it marked
+    # unconfirmed until matching photos (or the manufacturer) confirm it.
     known = supabase.table("ingredients").select("name,e_number,default_status").execute()
     analysis = await analyze_ingredients(ingredients_text, known.data or [])
     if analysis.get("failed"):
@@ -771,84 +822,68 @@ async def scan_product_label(
             detail="We read the label but couldn't check the ingredients just now. Try again in a minute.",
         )
 
-    existing = None
-    if payload.barcode:
-        existing = _fetch_product_with_ingredients(supabase, "barcode", payload.barcode)
-    if not existing:
-        existing = _fetch_product_by_name_brand(supabase, product_name, brand)
-
     product_payload = {
         "name": product_name,
         "brand": brand,
         "barcode": payload.barcode,
         "overall_status": analysis.get("overall_status", "uncertain"),
-        "confidence_level": analysis.get("confidence", "low"),
+        "confidence_level": _normalize_confidence(analysis.get("confidence")),
         "verification_tier": 3,
         "data_source": "label_scan",
         "ingredients_text": ingredients_text,
         "analyzed_at": _now_iso(),
     }
-
-    first_scan = existing is None
-    # A label photo must never overwrite a community-reviewed or scholar-verified
-    # verdict. For those products the scan is recorded as a new formulation only.
+    # A reviewed verdict (tier 1-2) is never replaced by a photo.
     protected = bool(existing) and int(existing.get("verification_tier") or 3) < 3
     if protected:
         product = existing
     elif existing:
         update_payload = {key: value for key, value in product_payload.items() if value is not None}
         update_payload["scan_count"] = int(existing.get("scan_count") or 0) + 1
-        updated = (
-            supabase.table("products")
-            .update(update_payload)
-            .eq("id", existing["id"])
-            .execute()
-        )
+        updated = supabase.table("products").update(update_payload).eq("id", existing["id"]).execute()
         product = updated.data[0] if updated.data else {**existing, **update_payload}
     else:
         created = (
             supabase.table("products")
-            .insert(
-                {
-                    **{key: value for key, value in product_payload.items() if value is not None},
-                    "scan_count": 1,
-                }
-            )
+            .insert({**{key: value for key, value in product_payload.items() if value is not None}, "scan_count": 1})
             .execute()
         )
         if not created.data:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to create product.",
-            )
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to create product.")
         product = created.data[0]
 
+    formulation = _save_product_formulation(supabase, product["id"], ingredients_text, country_code, data_source="label_scan")
     if not protected:
-        _save_flagged_ingredients(
-            supabase,
-            product["id"],
-            analysis.get("flagged_ingredients") or [],
-            analysis.get("confidence"),
-        )
-    formulation = _save_product_formulation(
-        supabase,
-        product["id"],
-        ingredients_text,
-        country_code,
-        data_source="label_scan",
-    )
-    if not protected:
+        _save_flagged_ingredients(supabase, product["id"], analysis.get("flagged_ingredients") or [], analysis.get("confidence"))
         _record_analysis(supabase, product["id"], formulation, ingredients_text, analysis, "label_scan")
-    earns = under_daily_cap(supabase, "label_scans", user["id"], DAILY_LABEL_AWARDS)
-    supabase.table("label_scans").insert(
+    first = record_photo(
+        supabase,
+        product_id=product["id"],
+        formulation_id=(formulation or {}).get("id"),
+        user_id=user["id"],
+        text=ingredients_text,
+        confidence=confidence,
+        country=country_code,
+        matched=True,
+    )
+    # Visible in the review queue; confirm or undo it there at any time.
+    supabase.table("formulation_changes").insert(
         {
             "product_id": product["id"],
-            "user_id": user["id"],
-            "extracted_ingredients": ingredients_text,
-            "extraction_confidence": extraction.get("confidence") or "low",
             "country_code": country_code,
+            "new_formulation_id": (formulation or {}).get("id"),
+            "user_id": user["id"],
+            "added": [],
+            "removed": [],
+            "old_status": None,
+            "new_status": analysis.get("overall_status"),
+            "analysis": {k: analysis.get(k) for k in ("overall_status", "confidence", "flagged_ingredients")},
+            "applied": not protected,
         }
     ).execute()
+    await request_official_list(supabase, product, analysis.get("flagged_ingredients") or [])
+
+    earns = first and under_daily_cap(supabase, "label_scans", user["id"], DAILY_LABEL_AWARDS + 1)
     if earns:
         award_points(supabase, user["id"], LABEL_PHOTO)
 
@@ -856,6 +891,12 @@ async def scan_product_label(
     enriched["country_code"] = country_code
     enriched["product_formulation"] = formulation
     response = _build_scan_response(supabase, enriched, country_code)
+    response["label_result"] = {
+        "new_product": True,
+        "photos": 1,
+        "needed": CONFIRMATIONS_NEEDED,
+        "message": f"Thank you, your photo added this product. Its ingredients show as unconfirmed until {CONFIRMATIONS_NEEDED - 1} more shoppers photograph a matching label.",
+    }
     response["points_awarded"] = LABEL_PHOTO if earns else 0
     return response
 
@@ -883,6 +924,19 @@ async def surprising_products(supabase: Client = Depends(get_supabase)) -> dict:
         .limit(24)
         .execute()
     ).data or []
+    if rows:
+        confirmed = {
+            r["product_id"]
+            for r in (
+                supabase.table("product_formulations")
+                .select("product_id")
+                .not_.is_("confirmed_at", "null")
+                .in_("product_id", [row["id"] for row in rows])
+                .execute()
+            ).data
+            or []
+        }
+        rows = [row for row in rows if row["id"] in confirmed]
     items = []
     for row in rows:
         flagged = [
@@ -997,11 +1051,12 @@ async def get_halal_alternatives(
         .execute()
     ).data or []
     if tayyib_rows:
-        # A halal verdict only counts where we hold that country's formulation.
+        # A halal verdict only counts where we hold that country's confirmed formulation.
         with_formulation = (
             supabase.table("product_formulations")
             .select("product_id")
             .eq("country_code", country)
+            .not_.is_("confirmed_at", "null")
             .in_("product_id", [row["id"] for row in tayyib_rows])
             .execute()
         ).data or []

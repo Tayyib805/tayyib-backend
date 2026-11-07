@@ -1,11 +1,9 @@
 """Label spot-checks: does the label in the shop still match what we hold?
 
-A person photographs the ingredients of a product we already have. If the
-list matches, the stored formulation is marked verified. If it has
-changed, the old formulation is closed, the new one is stored, and the
-change goes to the admin review queue. For unreviewed (tier 3) products the
-new verdict applies straight away, the same as any label photo; a reviewed
-verdict (tier 1-2) is never replaced without an admin.
+The rules for what a photo can change live in app/services/label_qc.py:
+a matching photo verifies or confirms; a different label is stored
+unconfirmed and changes nothing until three accounts match it, an admin
+confirms it, or the manufacturer's list does.
 """
 
 from __future__ import annotations
@@ -28,13 +26,10 @@ from app.routers.products import (
     _fetch_product_with_ingredients,
     _normalize_confidence,
     _normalize_country_code,
-    _record_analysis,
-    _save_flagged_ingredients,
 )
-from app.services.claude_analysis import analyze_ingredients, describe_error, extract_ingredients_from_image
-from app.services.formulation_compare import compare
+from app.services.claude_analysis import describe_error, extract_ingredients_from_image
+from app.services.label_qc import CONFIRMATIONS_NEEDED, confirm_formulation, confirmations, outcome_message, process_label
 from app.services.points import DAILY_LABEL_AWARDS, LABEL_PHOTO, award_points, under_daily_cap
-from app.services.push import notify, product_followers
 
 router = APIRouter()
 log = logging.getLogger("tayyib.spotcheck")
@@ -56,7 +51,8 @@ def _now() -> str:
 
 
 def _award(supabase: Client, user_id: str) -> int:
-    if under_daily_cap(supabase, "label_scans", user_id, DAILY_LABEL_AWARDS):
+    # The photo's own row is already saved, so allow one more than the cap.
+    if under_daily_cap(supabase, "label_scans", user_id, DAILY_LABEL_AWARDS + 1):
         award_points(supabase, user_id, LABEL_PHOTO)
         return LABEL_PHOTO
     return 0
@@ -86,8 +82,7 @@ async def label_check(
     if not product:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found.")
     country = _normalize_country_code(payload.country_code)
-    stored = _fetch_latest_formulation(supabase, product_id, country)
-    if not stored or not stored.get("ingredients_text"):
+    if not _fetch_latest_formulation(supabase, product_id, country):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="We don't hold this product's ingredients yet.")
 
     try:
@@ -98,129 +93,35 @@ async def label_check(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="We couldn't read labels just now. Try again in a minute.",
         )
-    label_text = (extraction or {}).get("ingredients_text") if isinstance(extraction, dict) else None
-    diff = compare(stored["ingredients_text"], label_text or "")
-    if not (extraction or {}).get("found") or not label_text or not diff["readable"]:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="We couldn't see an ingredients list. Photograph just the ingredients, close up and in good light.",
-        )
-
-    supabase.table("label_scans").insert(
-        {
-            "product_id": product_id,
-            "user_id": user["id"],
-            "extracted_ingredients": label_text,
-            "extraction_confidence": _normalize_confidence(extraction.get("confidence")),
-            "country_code": country,
-            "verified": diff["matched"],
-        }
-    ).execute()
-    points = _award(supabase, user["id"])
-
-    if diff["matched"]:
-        supabase.table("product_formulations").update({"last_verified_at": _now()}).eq("id", stored["id"]).execute()
-        return {
-            "matched": True,
-            "points_awarded": points,
-            "message": "Your label matches what we have. Thank you for checking.",
-        }
-
-    # The recipe looks different. Keep the old record, start a new one.
-    now = _now()
-    supabase.table("product_formulations").update({"effective_to": now}).eq("id", stored["id"]).execute()
-    created = (
-        supabase.table("product_formulations")
-        .insert(
-            {
-                "product_id": product_id,
-                "ingredients_text": label_text,
-                "country_code": country,
-                "data_source": "label_scan",
-                "effective_from": now,
-                "last_verified_at": now,
-            }
-        )
-        .execute()
-    ).data
-    new_formulation = created[0] if created else None
-
-    known = supabase.table("ingredients").select("name,e_number,default_status").execute()
-    analysis = await analyze_ingredients(label_text, known.data or [])
-    analysed = not analysis.get("failed")
-    old_status = product.get("overall_status")
-    new_status = analysis.get("overall_status") if analysed else None
-    protected = int(product.get("verification_tier") or 3) < 3
-    applied = analysed and not protected
-    if applied:
-        _apply_analysis(supabase, product_id, new_formulation, label_text, analysis)
-
-    supabase.table("formulation_changes").insert(
-        {
-            "product_id": product_id,
-            "country_code": country,
-            "old_formulation_id": stored["id"],
-            "new_formulation_id": (new_formulation or {}).get("id"),
-            "user_id": user["id"],
-            "added": diff["added"],
-            "removed": diff["removed"],
-            "old_status": old_status,
-            "new_status": new_status,
-            "analysis": {k: analysis.get(k) for k in ("overall_status", "confidence", "flagged_ingredients")} if analysed else None,
-            "applied": applied,
-        }
-    ).execute()
-
-    if applied and new_status != old_status:
-        _tell_followers(supabase, product, new_status, exclude={user["id"]})
-
-    result = {
-        "matched": False,
-        "added": diff["added"],
-        "removed": diff["removed"],
-        "old_status": old_status,
-        "new_status": new_status,
-        "applied": applied,
-        "points_awarded": points,
-    }
-    if applied:
-        enriched = _fetch_product_with_ingredients(supabase, "id", product_id) or product
-        result["verdict"] = _build_scan_response(supabase, enriched, country)
-        result["message"] = "We've updated the verdict to match your label. Thank you for checking."
-    elif protected:
-        result["message"] = "A person reviewed this product before, so we'll check the change before updating its verdict. Thank you."
-    else:
-        result["message"] = "We've saved the new ingredients and will check them shortly. Thank you."
-    return result
-
-
-def _apply_analysis(supabase: Client, product_id: str, formulation: dict | None, text: str, analysis: dict) -> None:
-    supabase.table("products").update(
-        {
-            "overall_status": analysis.get("overall_status"),
-            "confidence_level": _normalize_confidence(analysis.get("confidence")),
-            "ingredients_text": text,
-            "analyzed_at": _now(),
-            "verification_tier": 3,
-        }
-    ).eq("id", product_id).execute()
-    _save_flagged_ingredients(supabase, product_id, analysis.get("flagged_ingredients") or [], analysis.get("confidence"))
-    _record_analysis(supabase, product_id, formulation, text, analysis, "label_scan")
-
-
-WORD = {"halal": "halal", "haram": "haram", "uncertain": "unsure"}
-
-
-def _tell_followers(supabase: Client, product: dict, new_status: str | None, exclude: set[str]) -> None:
-    followers = product_followers(supabase, product["id"]) - exclude
-    notify(
-        supabase,
-        followers,
-        "A recipe changed",
-        f"{product.get('name') or 'A product you follow'} has new ingredients and is now marked {WORD.get(new_status or '', 'unsure')}.",
-        f"/?product={product['id']}",
-        f"recipe-{product['id']}",
+    extraction = extraction if isinstance(extraction, dict) else {}
+    label_text = extraction.get("ingredients_text")
+    unreadable = HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="We couldn't see an ingredients list. Photograph just the ingredients, close up and in good light.",
     )
+    if not extraction.get("found") or not label_text:
+        raise unreadable
+
+    outcome = await process_label(
+        supabase,
+        product=product,
+        country=country,
+        user_id=user["id"],
+        text=label_text,
+        confidence=_normalize_confidence(extraction.get("confidence")),
+    )
+    if outcome.get("unreadable"):
+        raise unreadable
+    points = _award(supabase, user["id"]) if outcome.get("first_time") else 0
+
+    result = {k: v for k, v in outcome.items() if k != "product"}
+    result["points_awarded"] = points
+    result["message"] = outcome_message(outcome)
+    if outcome.get("applied") and outcome.get("product"):
+        enriched = outcome["product"]
+        enriched["country_code"] = country
+        result["verdict"] = _build_scan_response(supabase, enriched, country)
+    return result
 
 
 # ── Admin review ─────────────────────────────────────────────────────────────
@@ -255,6 +156,20 @@ async def pending_changes(user: dict = Depends(get_current_user), supabase: Clie
         r["old_text"] = texts.get(r.get("old_formulation_id"))
         r["new_text"] = texts.get(r.get("new_formulation_id"))
         r.pop("analysis", None)
+        r["photos"] = confirmations(supabase, r["new_formulation_id"]) if r.get("new_formulation_id") else 0
+        r["needed"] = CONFIRMATIONS_NEEDED
+        # Shoppers whose label still matched the old list after this was reported.
+        r["old_list_photos"] = 0
+        if r.get("old_formulation_id"):
+            since = (
+                supabase.table("label_scans")
+                .select("user_id")
+                .eq("formulation_id", r["old_formulation_id"])
+                .eq("verified", True)
+                .gte("created_at", r["created_at"])
+                .execute()
+            ).data or []
+            r["old_list_photos"] = len({x["user_id"] for x in since if x.get("user_id")})
     return rows
 
 
@@ -277,34 +192,32 @@ async def decide_change(
     product = _fetch_product_with_ingredients(supabase, "id", change["product_id"]) or {"id": change["product_id"]}
 
     if payload.decision == "confirm":
-        if not change.get("applied") and change.get("new_formulation_id"):
-            # The verdict was for the old recipe; the new one gets its own.
-            formulation = {"id": change["new_formulation_id"]}
-            text = (
-                supabase.table("product_formulations").select("ingredients_text").eq("id", change["new_formulation_id"]).limit(1).execute().data
-                or [{}]
-            )[0].get("ingredients_text") or ""
-            analysis = change.get("analysis")
-            if not analysis and text:
-                known = supabase.table("ingredients").select("name,e_number,default_status").execute()
-                analysis = await analyze_ingredients(text, known.data or [])
-                if analysis.get("failed"):
-                    raise HTTPException(
-                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                        detail="We couldn't check the new ingredients just now. Try again in a minute.",
-                    )
-            if analysis and text:
-                _apply_analysis(supabase, change["product_id"], formulation, text, analysis)
-                if analysis.get("overall_status") != product.get("overall_status"):
-                    _tell_followers(supabase, product, analysis.get("overall_status"), exclude=set())
-    else:
-        # The photo was wrong: drop the new record and reopen the old one.
+        formulation = None
         if change.get("new_formulation_id"):
+            rows_f = supabase.table("product_formulations").select("*").eq("id", change["new_formulation_id"]).limit(1).execute().data
+            formulation = rows_f[0] if rows_f else None
+        if formulation:
+            done = await confirm_formulation(supabase, product, formulation, by="admin")
+            if done.get("verdict_pending"):
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Confirmed, but we couldn't check the new ingredients just now. Try again in a minute.",
+                )
+    else:
+        # The photo was wrong: drop its reading and reopen what we had.
+        if change.get("new_formulation_id"):
+            supabase.table("label_scans").update({"verified": False}).eq("formulation_id", change["new_formulation_id"]).execute()
             supabase.table("product_formulations").delete().eq("id", change["new_formulation_id"]).execute()
         if change.get("old_formulation_id"):
             supabase.table("product_formulations").update({"effective_to": None}).eq("id", change["old_formulation_id"]).execute()
-        if change.get("applied"):
+        if change.get("applied") and change.get("old_formulation_id"):
             _restore_previous(supabase, change)
+        elif change.get("applied"):
+            # A product known only from that photo: forget the reading, so
+            # the next scan asks for a label photo again.
+            supabase.table("products").update(
+                {"analyzed_at": None, "ingredients_text": None, "overall_status": "uncertain", "confidence_level": "low"}
+            ).eq("id", change["product_id"]).execute()
 
     supabase.table("formulation_changes").update(
         {
