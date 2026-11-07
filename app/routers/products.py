@@ -13,6 +13,7 @@ from app.services.claude_analysis import analyze_ingredients, extract_ingredient
 from app.ratelimit import rate_limit
 from app.services.alternatives import build_alternatives, category_chain, category_label
 from app.services.openfoodfacts import lookup_barcode, search_halal_labeled
+from app.services.points import CONFIRM_RESULT, DAILY_LABEL_AWARDS, LABEL_PHOTO, award_points, under_daily_cap
 
 router = APIRouter()
 
@@ -631,6 +632,7 @@ async def scan_product_label(
         country_code,
         data_source="label_scan",
     )
+    earns = under_daily_cap(supabase, "label_scans", user["id"], DAILY_LABEL_AWARDS)
     supabase.table("label_scans").insert(
         {
             "product_id": product["id"],
@@ -640,6 +642,8 @@ async def scan_product_label(
             "country_code": country_code,
         }
     ).execute()
+    if earns:
+        award_points(supabase, user["id"], LABEL_PHOTO)
 
     enriched = _fetch_product_with_ingredients(supabase, "id", product["id"]) or product
     enriched["country_code"] = country_code
@@ -810,6 +814,8 @@ async def vote_to_elevate_product(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="User has already voted for this product.",
         ) from exc
+
+    award_points(supabase, user["id"], CONFIRM_RESULT)
 
     vote_count = int(product.get("vote_count") or 0) + 1
     verification_tier = int(product.get("verification_tier") or 3)
