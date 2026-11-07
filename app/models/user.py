@@ -1,6 +1,10 @@
 """User profile request models."""
 
-from pydantic import BaseModel
+from typing import Literal
+
+from pydantic import BaseModel, Field, field_validator
+
+Madhab = Literal["general", "hanafi", "shafii", "maliki", "hanbali", "strict"]
 
 
 class UserProfileUpdate(BaseModel):
@@ -9,8 +13,13 @@ class UserProfileUpdate(BaseModel):
     The app sends `madhab`; older clients send `madhab_preference`.
     """
 
-    madhab_preference: str | None = None
-    madhab: str | None = None
+    madhab_preference: Madhab | None = None
+    madhab: Madhab | None = None
     madhab_set: bool | None = None
-    active_theme: str | None = None
-    active_companion: str | None = None
+    active_theme: str | None = Field(default=None, max_length=40, pattern=r"^[a-z0-9_-]+$")
+    active_companion: str | None = Field(default=None, max_length=20)
+
+    @field_validator("madhab", "madhab_preference", mode="before")
+    @classmethod
+    def _old_spelling(cls, value):
+        return "shafii" if value == "shafi" else value

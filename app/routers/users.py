@@ -5,6 +5,7 @@ from supabase import Client
 
 from app.database import get_current_user, get_supabase
 from app.models.user import UserProfileUpdate
+from app.services.push import COMPANIONS
 
 router = APIRouter()
 
@@ -51,6 +52,16 @@ async def update_me(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="No profile fields provided.",
         )
+
+    companion = updates.get("active_companion")
+    if companion:
+        needed = next((pts for pts, cid, _ in COMPANIONS if cid == companion), None)
+        if needed is None:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unknown companion.")
+        if needed > 0:
+            rows = supabase.table("user_profiles").select("points").eq("id", user["id"]).limit(1).execute().data
+            if int((rows[0].get("points") if rows else 0) or 0) < needed:
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="That companion isn't unlocked yet.")
 
     # Upsert so the first update also creates the row. Privileged columns are
     # never in `updates`, and a database trigger guards them as well.

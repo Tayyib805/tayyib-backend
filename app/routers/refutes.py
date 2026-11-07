@@ -43,7 +43,7 @@ class ResolveRefuteRequest(BaseModel):
     """Payload for resolving a refute from the admin queue."""
 
     status: RefuteStatus
-    review_notes: str
+    review_notes: str = Field(default="", max_length=1000)
 
 
 def _now() -> str:
@@ -420,17 +420,21 @@ async def get_admin_refute_queue(
     user: dict = Depends(get_current_user),
     supabase: Client = Depends(get_supabase),
 ) -> list[dict]:
-    """Return refutes waiting for admin or scholar review."""
+    """Every challenge still open, the ones that reached review first."""
 
     await _require_admin(user, supabase)
     response = (
         supabase.table("product_refutes")
         .select("*, products(name,brand,barcode,overall_status)")
-        .in_("status", ["under_review", "escalated_to_scholar"])
+        .in_("status", ["open", "under_review", "escalated_to_scholar"])
         .order("support_votes", desc=True)
+        .limit(200)
         .execute()
     )
-    return response.data or []
+    rank = {"escalated_to_scholar": 0, "under_review": 1, "open": 2}
+    rows = response.data or []
+    rows.sort(key=lambda r: rank.get(r.get("status") or "open", 3))
+    return rows
 
 
 @router.post("/{refute_id}/resolve")
@@ -444,6 +448,8 @@ async def resolve_refute(
 
     await _require_admin(user, supabase)
     refute = _require_refute(supabase, refute_id)
+    if refute.get("status") in {"accepted", "rejected"}:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="This challenge has already been decided.")
     updates = {
         "status": payload.status,
         "review_notes": payload.review_notes,

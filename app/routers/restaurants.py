@@ -215,7 +215,7 @@ async def get_restaurant(
     return response.data[0]
 
 
-@router.post("")
+@router.post("", dependencies=[Depends(rate_limit("suggest_place", 10, 86400))])
 async def create_restaurant(
     payload: RestaurantCreate,
     user: dict = Depends(get_current_user),
