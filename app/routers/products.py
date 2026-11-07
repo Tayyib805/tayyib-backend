@@ -1,8 +1,9 @@
 """Product lookup, scan, label enrichment, and voting endpoints."""
 
 import re
+import time
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from supabase import Client
@@ -10,7 +11,8 @@ from supabase import Client
 from app.database import get_current_user, get_supabase
 from app.services.claude_analysis import analyze_ingredients, extract_ingredients_from_image
 from app.ratelimit import rate_limit
-from app.services.openfoodfacts import lookup_barcode
+from app.services.alternatives import build_alternatives, category_chain, category_label
+from app.services.openfoodfacts import lookup_barcode, search_halal_labeled
 
 router = APIRouter()
 
@@ -196,6 +198,9 @@ def _build_scan_response(
         "tier": product.get("verification_tier"),
         "scan_count": product.get("scan_count") or 0,
         "country_code": country_code,
+        "barcode": product.get("barcode"),
+        "image_url": product.get("image_url"),
+        "category": category_label(product.get("primary_category")),
     }
 
 
@@ -418,6 +423,9 @@ async def _analyze_and_enrich_product(
         "ingredients_text": ingredients_text,
         "data_source": "open_food_facts",
     }
+    if off_product.get("categories"):
+        updates["categories"] = off_product["categories"]
+        updates["primary_category"] = off_product.get("primary_category")
 
     if product:
         scan_count = int(product.get("scan_count") or 0) + 1
@@ -637,6 +645,137 @@ async def scan_product_label(
     enriched["country_code"] = country_code
     enriched["product_formulation"] = formulation
     return _build_scan_response(supabase, enriched, country_code)
+
+
+_stats_cache: dict = {"at": 0.0, "data": None}
+
+
+@router.get("/stats")
+async def product_stats(supabase: Client = Depends(get_supabase)) -> dict:
+    """Return live database totals for the home screen (cached for five minutes)."""
+
+    now = time.monotonic()
+    if _stats_cache["data"] and now - _stats_cache["at"] < 300:
+        return _stats_cache["data"]
+
+    def count(query) -> int:
+        return int(query.limit(1).execute().count or 0)
+
+    data = {
+        "products": count(supabase.table("products").select("id", count="exact")),
+        "halal": count(supabase.table("products").select("id", count="exact").eq("overall_status", "halal")),
+        "reviewed": count(supabase.table("products").select("id", count="exact").lt("verification_tier", 3)),
+    }
+    _stats_cache.update(at=now, data=data)
+    return data
+
+
+@router.get(
+    "/{product_id}/alternatives",
+    dependencies=[Depends(rate_limit("alternatives_minute", 30, 60))],
+)
+async def get_halal_alternatives(
+    product_id: str,
+    country_code: str = "US",
+    limit: int = Query(default=6, ge=1, le=12),
+    supabase: Client = Depends(get_supabase),
+) -> dict:
+    """Suggest halal products in the same category, sold in the user's country.
+
+    Our own halal verdicts come first. Open Food Facts products with a halal
+    certification label fill the rest and are marked as label claims.
+    """
+
+    found = (
+        supabase.table("products")
+        .select("id,barcode,categories,primary_category")
+        .eq("id", product_id)
+        .limit(1)
+        .execute()
+    )
+    if not found.data:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found.")
+    product = found.data[0]
+    country = _normalize_country_code(country_code)
+
+    categories = product.get("categories") or []
+    primary = product.get("primary_category")
+    if not categories and product.get("barcode"):
+        # Products saved before categories existed: fill them in once.
+        off_product = await lookup_barcode(product["barcode"], country)
+        if off_product.get("found") and off_product.get("categories"):
+            categories = off_product["categories"]
+            primary = off_product.get("primary_category")
+            supabase.table("products").update(
+                {"categories": categories, "primary_category": primary}
+            ).eq("id", product_id).execute()
+
+    chain = category_chain(categories, primary)
+    response = {
+        "product_id": product_id,
+        "country_code": country,
+        "category": category_label(chain[0]) if chain else None,
+        "items": [],
+        "label_search": "skipped",
+    }
+    if not chain:
+        return response
+
+    array_literal = "{" + ",".join(f'"{tag}"' for tag in chain) + "}"
+    tayyib_rows = (
+        supabase.table("products")
+        .select("id,barcode,name,brand,image_url,verification_tier,scan_count,categories")
+        .eq("overall_status", "halal")
+        .neq("id", product_id)
+        .filter("categories", "ov", array_literal)
+        .limit(40)
+        .execute()
+    ).data or []
+    if tayyib_rows:
+        # A halal verdict only counts where we hold that country's formulation.
+        with_formulation = (
+            supabase.table("product_formulations")
+            .select("product_id")
+            .eq("country_code", country)
+            .in_("product_id", [row["id"] for row in tayyib_rows])
+            .execute()
+        ).data or []
+        allowed = {row["product_id"] for row in with_formulation}
+        tayyib_rows = [row for row in tayyib_rows if row["id"] in allowed]
+
+    label_rows: list[dict] = []
+    label_search = "ok"
+    if len(tayyib_rows) < limit:
+        for tag in chain[:2]:
+            results = await search_halal_labeled(tag, country, limit=12)
+            if results is None:
+                label_search = "unavailable"
+                break
+            label_rows.extend(results)
+            if len(tayyib_rows) + len(label_rows) >= limit * 2:
+                break
+
+    known_status: dict[str, str] = {}
+    label_barcodes = list({row["barcode"] for row in label_rows})[:100]
+    if label_barcodes:
+        known = (
+            supabase.table("products")
+            .select("barcode,overall_status")
+            .in_("barcode", label_barcodes)
+            .execute()
+        ).data or []
+        known_status = {row["barcode"]: row.get("overall_status") or "uncertain" for row in known}
+
+    response["items"] = build_alternatives(
+        scanned_barcode=product.get("barcode"),
+        chain=chain,
+        tayyib_rows=tayyib_rows,
+        label_rows=label_rows,
+        known_status_by_barcode=known_status,
+        limit=limit,
+    )
+    response["label_search"] = label_search
+    return response
 
 
 @router.get("/{product_id}")

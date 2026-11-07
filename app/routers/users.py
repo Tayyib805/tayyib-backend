@@ -34,24 +34,30 @@ async def get_me(
 
 
 @router.put("/me")
+@router.patch("/me")
 async def update_me(
     payload: UserProfileUpdate,
     user: dict = Depends(get_current_user),
     supabase: Client = Depends(get_supabase),
 ) -> dict:
-    """Update authenticated user's profile preferences."""
+    """Update the authenticated user's profile preferences (PUT or PATCH)."""
 
     updates = payload.model_dump(exclude_none=True)
+    madhab = updates.pop("madhab", None)
+    updates.pop("madhab_set", None)  # tracked in the app's profiles table
+    if madhab and "madhab_preference" not in updates:
+        updates["madhab_preference"] = madhab
     if not updates:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="No profile fields provided.",
         )
 
+    # Upsert so the first update also creates the row. Privileged columns are
+    # never in `updates`, and a database trigger guards them as well.
     response = (
         supabase.table("user_profiles")
-        .update(updates)
-        .eq("id", user["id"])
+        .upsert({"id": user["id"], **updates}, on_conflict="id")
         .execute()
     )
     return response.data[0] if response.data else {"id": user["id"], **updates}
@@ -70,10 +76,15 @@ async def get_my_scans(
     end = start + page_size - 1
     response = (
         supabase.table("scan_logs")
-        .select("*, products(*)")
+        .select("*, products(id,name,brand,barcode,image_url,overall_status,verification_tier)", count="exact")
         .eq("user_id", user["id"])
         .order("scanned_at", desc=True)
         .range(start, end)
         .execute()
     )
-    return {"page": page, "page_size": page_size, "items": response.data or []}
+    return {
+        "page": page,
+        "page_size": page_size,
+        "total": response.count or 0,
+        "items": response.data or [],
+    }

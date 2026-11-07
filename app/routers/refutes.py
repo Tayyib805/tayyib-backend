@@ -369,6 +369,10 @@ async def get_product_refutes(
         .execute()
     )
     refutes = response.data or []
+    for refute in refutes:
+        # Public endpoint: never reveal who filed a refute or who reviewed it.
+        refute.pop("user_id", None)
+        refute.pop("reviewed_by", None)
     refutes.sort(key=lambda item: (0 if item.get("status") == "open" else 1, -int(item.get("support_votes") or 0)))
 
     if not user or not refutes:
