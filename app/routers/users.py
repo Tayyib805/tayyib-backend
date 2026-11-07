@@ -44,7 +44,6 @@ async def update_me(
 
     updates = payload.model_dump(exclude_none=True)
     madhab = updates.pop("madhab", None)
-    updates.pop("madhab_set", None)  # tracked in the app's profiles table
     if madhab and "madhab_preference" not in updates:
         updates["madhab_preference"] = madhab
     if not updates:
