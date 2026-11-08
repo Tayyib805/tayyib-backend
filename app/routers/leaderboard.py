@@ -7,6 +7,7 @@ from supabase import Client
 
 from app.database import get_optional_user, get_supabase
 from app.ratelimit import rate_limit
+from app.services.article_text import clean_display_name
 from app.services.push import NAMES
 
 router = APIRouter()
@@ -33,7 +34,7 @@ async def scan_leaderboard(
     for i, r in enumerate(rows):
         entry = {
             "rank": int(r["rank"]),
-            "name": (r.get("display_name") or "").strip() or f"Shopper {r['tag']}",
+            "name": clean_display_name(r.get("display_name")) or f"Shopper {r['tag']}",
             "companion": r.get("active_companion") if r.get("active_companion") in NAMES else "bee",
             "products": int(r["products"]),
             "is_me": bool(r.get("is_me")),

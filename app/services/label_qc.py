@@ -199,6 +199,8 @@ async def confirm_formulation(supabase: "Client", product: dict, formulation: di
                     "ingredients_text": text,
                     "analyzed_at": now,
                     "verification_tier": 3,
+                    # A new recipe: whoever verified the old one hasn't seen this one.
+                    "verified_source": None,
                 }
             ).eq("id", product["id"]).execute()
             _save_flagged_ingredients(supabase, product["id"], analysis.get("flagged_ingredients") or [], analysis.get("confidence"))

@@ -332,7 +332,7 @@ async def add_comment(
             detail="Names can be 2–40 characters, without emails or links.",
         )
     if chosen:
-        supabase.table("profiles").update({"display_name": chosen}).eq("id", user["id"]).execute()
+        supabase.table("user_profiles").update({"display_name": chosen, "name_chosen": True}).eq("id", user["id"]).execute()
     name = chosen or public_name(profile[0].get("display_name") if profile else None, user.get("email"))
 
     row = (

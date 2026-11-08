@@ -113,11 +113,8 @@ def _fetch_product_by_name_brand(
     return response.data[0] if response.data else None
 
 
-def _fetch_latest_analysis_flagged_ingredients(
-    supabase: Client,
-    product_id: str,
-) -> list[dict]:
-    """Fetch flagged ingredients from the latest stored analysis run."""
+def _latest_result(supabase: Client, product_id: str) -> dict:
+    """The result of the latest stored analysis run, or {}."""
 
     response = (
         supabase.table("analysis_runs")
@@ -128,11 +125,18 @@ def _fetch_latest_analysis_flagged_ingredients(
         .execute()
     )
     if not response.data:
-        return []
-
+        return {}
     result = response.data[0].get("result") or {}
-    if not isinstance(result, dict):
-        return []
+    return result if isinstance(result, dict) else {}
+
+
+def _fetch_latest_analysis_flagged_ingredients(
+    supabase: Client,
+    product_id: str,
+) -> list[dict]:
+    """Fetch flagged ingredients from the latest stored analysis run."""
+
+    result = _latest_result(supabase, product_id)
     flagged = result.get("flagged_ingredients") or []
     return flagged if isinstance(flagged, list) else []
 
@@ -208,7 +212,20 @@ def _build_scan_response(
         "image_url": product.get("image_url"),
         "category": category_label(product.get("primary_category")),
         "label_status": _safe_label_status(supabase, product, country_code),
+        "verified_source": product.get("verified_source"),
+        "manufacturer_confirmed": _maker_note(supabase, product),
     }
+
+
+def _maker_note(supabase: Client, product: dict) -> dict | None:
+    """The maker's public summary, when their written answer settled the verdict."""
+
+    if product.get("verified_source") != "manufacturer":
+        return None
+    note = _latest_result(supabase, product["id"]).get("manufacturer_confirmed")
+    if not isinstance(note, dict):
+        return None
+    return {"brand": note.get("brand"), "summary": note.get("summary")}
 
 
 def _safe_label_status(supabase: Client, product: dict, country_code: str) -> dict | None:

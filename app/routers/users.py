@@ -5,6 +5,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from supabase import Client
 
+from app.services.article_text import clean_display_name
 from app.database import get_current_user, get_supabase
 from app.models.user import UserProfileUpdate
 from app.ratelimit import rate_limit
@@ -30,7 +31,7 @@ async def get_me(
     if not response.data:
         created = (
             supabase.table("user_profiles")
-            .insert({"id": user["id"], "display_name": user.get("email")})
+            .insert({"id": user["id"]})
             .execute()
         )
         return created.data[0] if created.data else {"id": user["id"]}
@@ -47,6 +48,19 @@ async def update_me(
     """Update the authenticated user's profile preferences (PUT or PATCH)."""
 
     updates = payload.model_dump(exclude_none=True)
+    if "display_name" in updates:
+        raw = updates.pop("display_name").strip()
+        if not raw:
+            updates.update({"display_name": None, "name_chosen": False})
+        else:
+            cleaned = clean_display_name(raw)
+            local_part = (user.get("email") or "").split("@")[0].lower()
+            if not cleaned or (local_part and cleaned.lower() == local_part):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Names can be 2–40 characters, without emails, links or your email username.",
+                )
+            updates.update({"display_name": cleaned, "name_chosen": True})
     madhab = updates.pop("madhab", None)
     if madhab and "madhab_preference" not in updates:
         updates["madhab_preference"] = madhab

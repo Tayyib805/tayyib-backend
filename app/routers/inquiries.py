@@ -2,6 +2,8 @@
 
 from datetime import UTC, datetime
 
+from typing import Literal
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from supabase import Client
@@ -44,6 +46,9 @@ class ManufacturerResponseRequest(BaseModel):
     # the list we hold for that country.
     official_ingredients: str | None = Field(default=None, max_length=6_000)
     country_code: str = Field(default="US", max_length=8)
+    # The reply settles the verdict: the product becomes tier 1,
+    # "manufacturer confirmed". Leave empty when it doesn't settle it.
+    settled_status: Literal["halal", "haram"] | None = None
 
 
 def _now() -> str:
@@ -650,18 +655,79 @@ async def log_manufacturer_response(
         inquiry["ingredients_update"] = await apply_official_list(
             supabase, inquiry["product_id"], payload.country_code, official
         )
-    if payload.resolved and inquiry.get("product_id"):
-        product = (
-            supabase.table("products")
-            .select("id,vote_count")
-            .eq("id", inquiry["product_id"])
-            .limit(1)
-            .execute()
-        )
-        if product.data:
-            vote_count = int(product.data[0].get("vote_count") or 0) + 1
-            supabase.table("products").update({"vote_count": vote_count}).eq(
-                "id", inquiry["product_id"]
-            ).execute()
+    if payload.settled_status and inquiry.get("product_id"):
+        inquiry["settled"] = _settle_from_reply(supabase, inquiry, payload, user["id"])
 
     return inquiry
+
+
+def _settle_from_reply(supabase: Client, inquiry: dict, payload: ManufacturerResponseRequest, admin_id: str) -> dict:
+    """The manufacturer's written answer settles the verdict (tier 1)."""
+
+    product_id = inquiry["product_id"]
+    rows = supabase.table("products").select("id,name,overall_status").eq("id", product_id).limit(1).execute().data
+    if not rows:
+        return {"settled": False}
+    product = rows[0]
+    status_now = payload.settled_status
+    summary = (payload.resolution_notes or "").strip()
+    reason = f"Confirmed in writing by {inquiry.get('brand_name') or 'the manufacturer'}" + (f": {summary}" if summary else ".")
+    supabase.table("products").update(
+        {
+            "overall_status": status_now,
+            "confidence_level": "high",
+            "verification_tier": 1,
+            "verified_source": "manufacturer",
+            "reviewed_by": admin_id,
+            "analyzed_at": _now(),
+            "updated_at": _now(),
+        }
+    ).eq("id", product_id).execute()
+
+    # Keep the ingredient list in step: what was in question is answered.
+    latest = (
+        supabase.table("analysis_runs")
+        .select("result,input_text,product_formulation_id")
+        .eq("product_id", product_id)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    ).data
+    base = (latest[0] if latest else {}) or {}
+    result = dict(base.get("result") or {})
+    flagged = [dict(f) for f in (result.get("flagged_ingredients") or []) if isinstance(f, dict)]
+    if status_now == "halal":
+        for item in flagged:
+            if item.get("status") != "halal":
+                item.update({"status": "halal", "reason": reason})
+    result.update(
+        {
+            "overall_status": status_now,
+            "confidence": "high",
+            "flagged_ingredients": flagged,
+            "manufacturer_confirmed": {"inquiry_id": inquiry["id"], "brand": inquiry.get("brand_name"), "summary": summary},
+        }
+    )
+    supabase.table("analysis_runs").insert(
+        {
+            "product_id": product_id,
+            "product_formulation_id": base.get("product_formulation_id"),
+            "analysis_type": "ingredients_text",
+            "input_text": base.get("input_text"),
+            "result": result,
+            "overall_status": status_now,
+            "confidence_level": "high",
+            "data_source": "admin_entry",
+        }
+    ).execute()
+    supabase.table("manufacturer_inquiries").update({"resolved": True}).eq("id", inquiry["id"]).execute()
+    if product.get("overall_status") != status_now:
+        notify(
+            supabase,
+            product_followers(supabase, product_id),
+            "Confirmed by the maker",
+            f"{product.get('name') or 'A product you follow'} is now marked {status_now}, from {inquiry.get('brand_name') or 'the manufacturer'}'s written answer.",
+            f"/?product={product_id}",
+            f"settled-{product_id}",
+        )
+    return {"settled": True, "status": status_now}
