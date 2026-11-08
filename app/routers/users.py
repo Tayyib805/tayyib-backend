@@ -1,10 +1,13 @@
 """Authenticated user profile endpoints."""
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from supabase import Client
 
 from app.database import get_current_user, get_supabase
 from app.models.user import UserProfileUpdate
+from app.ratelimit import rate_limit
 from app.services.push import COMPANIONS
 
 router = APIRouter()
@@ -98,3 +101,27 @@ async def get_my_scans(
         "total": response.count or 0,
         "items": response.data or [],
     }
+
+
+@router.delete("/me", dependencies=[Depends(rate_limit("delete_account", 5, 3600))])
+async def delete_me(
+    user: dict = Depends(get_current_user),
+    supabase: Client = Depends(get_supabase),
+) -> dict:
+    """Delete the signed-in account and everything personal tied to it.
+
+    Profile, scan history, favourites, votes, phone notifications and
+    reviews go with the account (database cascades). Contributions others
+    rely on (label readings, challenges, suggested places) stay, without
+    the name. Required by the App Store for apps with sign-up.
+    """
+
+    try:
+        supabase.auth.admin.delete_user(user["id"])
+    except Exception as exc:
+        logging.getLogger("tayyib.users").error("Account deletion failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="We couldn't delete your account just now. Please try again, or email verify@tayyib.app.",
+        ) from exc
+    return {"deleted": True}

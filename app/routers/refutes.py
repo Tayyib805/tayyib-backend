@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 from supabase import Client
 
 from app.database import get_current_user, get_supabase
+from app.ratelimit import rate_limit
 from app.services.claude_analysis import analyze_ingredients
 from app.services.trust import vote_counts, why_not_counted
 from app.services.push import notify, product_followers
@@ -25,11 +26,11 @@ VoteType = Literal["support", "oppose"]
 class CreateRefuteRequest(BaseModel):
     """Payload for challenging a product ruling."""
 
-    ingredient_name: str | None = None
+    ingredient_name: str | None = Field(default=None, max_length=120)
     challenged_status: HalalStatus
     proposed_status: HalalStatus
-    reasoning: str = Field(min_length=20)
-    evidence_url: str | None = None
+    reasoning: str = Field(min_length=20, max_length=2000)
+    evidence_url: str | None = Field(default=None, max_length=500, pattern=r"^https?://")
     refute_type: RefuteType = "ingredient"
 
 
@@ -230,20 +231,18 @@ def _apply_accepted_refute(supabase: Client, refute: dict) -> None:
     if not ingredient_name:
         return
 
+    # Only this product changes. A challenge is evidence about one product
+    # (one recipe, one supplier), never a new ruling on the ingredient
+    # everywhere, so the shared ingredient list is left alone.
     links = (
         supabase.table("product_ingredients")
-        .select("id,ingredient_id,ingredients(name)")
+        .select("id,ingredients(name)")
         .eq("product_id", product_id)
         .execute()
     )
     for link in links.data or []:
-        ingredient = link.get("ingredients") or {}
-        if (ingredient.get("name") or "").strip().lower() != ingredient_name:
+        if ((link.get("ingredients") or {}).get("name") or "").strip().lower() != ingredient_name:
             continue
-        supabase.table("ingredients").update({"default_status": proposed_status}).eq(
-            "id",
-            link["ingredient_id"],
-        ).execute()
         supabase.table("product_ingredients").update(
             {
                 "variant_risk": proposed_status == "uncertain",
@@ -300,7 +299,7 @@ async def _reanalyze_for_refute(
     return "escalated_to_scholar", note
 
 
-@router.post("/products/{product_id}")
+@router.post("/products/{product_id}", dependencies=[Depends(rate_limit("refute_create", 10, 86_400))])
 async def create_product_refute(
     product_id: str,
     payload: CreateRefuteRequest,
@@ -355,7 +354,7 @@ async def create_product_refute(
     return created.data[0]
 
 
-@router.post("/{refute_id}/vote")
+@router.post("/{refute_id}/vote", dependencies=[Depends(rate_limit("refute_vote", 120, 3600))])
 async def vote_on_refute(
     refute_id: str,
     payload: VoteRequest,

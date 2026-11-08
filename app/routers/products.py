@@ -26,7 +26,7 @@ from app.services.label_qc import (
     record_photo,
     request_official_list,
 )
-from app.services.points import CONFIRM_RESULT, DAILY_LABEL_AWARDS, LABEL_PHOTO, award_points, under_daily_cap
+from app.services.points import CONFIRM_RESULT, DAILY_CONFIRM_AWARDS, DAILY_LABEL_AWARDS, LABEL_PHOTO, award_points, under_daily_cap
 
 router = APIRouter()
 
@@ -381,19 +381,6 @@ def _save_product_formulation(
     return created.data[0] if created.data else None
 
 
-def _ingredient_payload(flagged: dict) -> dict:
-    """Build an ingredient row from a flagged ingredient result."""
-
-    return {
-        "name": flagged.get("name") or "Unknown ingredient",
-        "e_number": flagged.get("e_number"),
-        "default_status": flagged.get("status") or "uncertain",
-        "has_variants": (flagged.get("status") or "uncertain") == "uncertain",
-        "ruling_notes": flagged.get("reason"),
-        "education_card_content": flagged.get("reason"),
-    }
-
-
 def _normalize_confidence(confidence: str | None) -> str:
     """Return a valid confidence value."""
 
@@ -433,16 +420,15 @@ def _find_ingredient_id(supabase: Client, flagged: dict) -> str | None:
 
 
 def _get_or_create_ingredient_id(supabase: Client, flagged: dict) -> str | None:
-    """Return an ingredient id, creating the ingredient if needed."""
+    """The curated ingredient this flag refers to, if we have one.
 
-    ingredient_id = _find_ingredient_id(supabase, flagged)
-    if ingredient_id:
-        return ingredient_id
+    Analysis output is never written into the shared ingredient list: that
+    list is fed back into every analysis as reference data, so it holds
+    curated entries only. Flags for other ingredients live in the
+    analysis record (analysis_runs), which scan results read.
+    """
 
-    created = supabase.table("ingredients").insert(_ingredient_payload(flagged)).execute()
-    if not created.data:
-        return None
-    return created.data[0]["id"]
+    return _find_ingredient_id(supabase, flagged)
 
 
 def _product_ingredient_payload(
@@ -1125,10 +1111,10 @@ async def get_product(product_id: str, supabase: Client = Depends(get_supabase))
     return product
 
 
-@router.post("/{product_id}/vote")
+@router.post("/{product_id}/vote", dependencies=[Depends(rate_limit("product_vote", 60, 3600))])
 async def vote_to_elevate_product(
     product_id: str,
-    reason: str = "regular_user",
+    reason: str = Query(default="regular_user", max_length=40),
     user: dict = Depends(get_current_user),
     supabase: Client = Depends(get_supabase),
 ) -> dict:
@@ -1148,11 +1134,24 @@ async def vote_to_elevate_product(
             detail="User has already voted for this product.",
         ) from exc
 
-    award_points(supabase, user["id"], CONFIRM_RESULT)
+    # The vote row is already saved, so allow one more than the cap.
+    earned = CONFIRM_RESULT if under_daily_cap(supabase, "tier_votes", user["id"], DAILY_CONFIRM_AWARDS + 1) else 0
+    if earned:
+        award_points(supabase, user["id"], earned)
 
     if not vote_counts(supabase, user):
         # Recorded (so it can't be repeated) but doesn't move the tier yet.
-        return {**product, "points_awarded": CONFIRM_RESULT, "counted": False, "message": why_not_counted()}
+        return {**product, "points_awarded": earned, "counted": False, "message": why_not_counted()}
+    current, pending = formulations(supabase, product_id, "US")
+    if not _is_analyzed(product) or not current or not current.get("confirmed_at") or pending:
+        # Nothing settled to confirm yet: no real verdict, or ingredients
+        # that still need confirming from label photos.
+        return {
+            **product,
+            "points_awarded": earned,
+            "counted": False,
+            "message": "Thanks. This verdict isn't settled yet, so your vote is saved but doesn't count toward review.",
+        }
 
     vote_count = int(product.get("vote_count") or 0) + 1
     verification_tier = int(product.get("verification_tier") or 3)
@@ -1169,6 +1168,6 @@ async def vote_to_elevate_product(
         .execute()
     )
     result = dict(updated.data[0]) if updated.data else {"id": product_id}
-    result["points_awarded"] = CONFIRM_RESULT
+    result["points_awarded"] = earned
     result["counted"] = True
     return result
