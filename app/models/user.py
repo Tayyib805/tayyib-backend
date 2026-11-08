@@ -18,6 +18,7 @@ class UserProfileUpdate(BaseModel):
     madhab_set: bool | None = None
     active_theme: str | None = Field(default=None, max_length=40, pattern=r"^[a-z0-9_-]+$")
     active_companion: str | None = Field(default=None, max_length=20)
+    leaderboard_visible: bool | None = None
 
     @field_validator("madhab", "madhab_preference", mode="before")
     @classmethod
