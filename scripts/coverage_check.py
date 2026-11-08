@@ -212,6 +212,14 @@ def main():
         report["overture_halal_category_in_area"] = sum(p["halal_category"] for p in open_ov)
         report["overture_halal_name_in_area"] = sum(p["halal_name"] for p in open_ov)
         report["overture_halal_any_in_area"] = sum(p["halal_category"] or p["halal_name"] for p in open_ov)
+        likely = re.compile(r"middle_eastern|pakistani|afghan|halal|turkish|persian|lebanese|arab|yemeni|egyptian|syrian|uyghur|bangladeshi|somali|uzbek|iraqi|moroccan|palestinian|jordanian|kebab|shawarma|falafel")
+        pool = [p for p in open_ov if likely.search(p["categories"][0].lower() + " " + p["name"].lower()) and "food_and_drink" in p["categories"][0]]
+        report["overture_candidate_pool"] = len(pool)
+        report["overture_candidate_pool_by_cuisine"] = {}
+        for p in pool:
+            m = re.search(r'"primary":"([^"]+)"', p["categories"][0])
+            k = m.group(1) if m else "other"
+            report["overture_candidate_pool_by_cuisine"][k] = report["overture_candidate_pool_by_cuisine"].get(k, 0) + 1
     except Exception as exc:  # noqa: BLE001
         ov, report["overture_error"] = [], f"{type(exc).__name__}: {exc}"
     try:
@@ -258,6 +266,7 @@ def main():
         f"- Overture marks halal (category or name): {report['ov_marks_halal']}/{n} (category alone: {report['ov_halal_category']})",
         f"- Overture whole area: open places {report.get('overture_places_in_area')}, halal category {report.get('overture_halal_category_in_area')}, "
         f"halal in name {report.get('overture_halal_name_in_area')}, either {report.get('overture_halal_any_in_area')}",
+        f"- Overture candidate pool (often-halal cuisines): {report.get('overture_candidate_pool')} {json.dumps(dict(sorted((report.get('overture_candidate_pool_by_cuisine') or {}).items(), key=lambda kv: -kv[1])[:15]))}",
         f"- OpenStreetMap tagged halal: {report['osm_found']}/{n}",
         f"- Shown as halal by either: {report['either_marks_halal']}/{n}",
         f"- Whole area: Foursquare open places {report.get('fsq_places_in_area')}, halal category {report.get('fsq_halal_category_in_area')}, "
