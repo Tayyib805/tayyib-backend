@@ -122,6 +122,44 @@ def fsq_places(bbox: tuple[float, float, float, float]) -> tuple[list[dict], str
     return out, release
 
 
+OVERTURE = "overturemaps-us-west-2"
+
+
+def latest_overture_release() -> str:
+    url = f"https://{OVERTURE}.s3.amazonaws.com/?list-type=2&prefix=release/&delimiter=/"
+    root = ET.fromstring(urllib.request.urlopen(url, timeout=60).read())
+    ns = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
+    prefixes = sorted(p.text for p in root.findall(".//s3:CommonPrefixes/s3:Prefix", ns))
+    if not prefixes:
+        raise RuntimeError("no Overture releases listed")
+    return prefixes[-1].rstrip("/")
+
+
+def overture_places(bbox) -> tuple[list[dict], str]:
+    release = latest_overture_release()
+    s, w, n, e = bbox
+    con = duckdb.connect()
+    con.execute("INSTALL httpfs; LOAD httpfs; SET s3_region='us-west-2';")
+    path = f"s3://{OVERTURE}/{release}/theme=places/type=place/*"
+    cols = {r[0] for r in con.execute(f"DESCRIBE SELECT * FROM read_parquet('{path}', hive_partitioning=1)").fetchall()}
+    cat_cols = [c for c in ["categories", "taxonomy", "basic_category"] if c in cols]
+    cat_expr = " || ' ' || ".join(f"coalesce(to_json({c})::VARCHAR, '')" for c in cat_cols) or "''"
+    status = "operating_status" if "operating_status" in cols else "NULL"
+    rows = con.execute(f"""
+        SELECT id, names.primary, bbox.ymin, bbox.xmin, {cat_expr}, {status},
+               coalesce(to_json(sources)::VARCHAR, '')
+        FROM read_parquet('{path}', hive_partitioning=1)
+        WHERE bbox.xmin BETWEEN {w} AND {e} AND bbox.ymin BETWEEN {s} AND {n}""").fetchall()
+    out = []
+    for pid, name, lat, lng, cats, st, srcs in rows:
+        cats = cats or ""
+        out.append({"source_id": pid, "name": name or "", "lat": lat, "lng": lng, "categories": [cats[:160]],
+                    "closed": st if st and st != "open" else None, "refreshed": "",
+                    "halal_category": "halal" in cats.lower(), "halal_name": "halal" in (name or "").lower(),
+                    "from": ",".join(sorted(set(re.findall(r'"dataset":"([^"]+)"', srcs))))})
+    return out, release
+
+
 def osm_places(bbox) -> list[dict]:
     import time
     s, w, n, e = bbox
@@ -167,6 +205,16 @@ def main():
     except Exception as exc:  # noqa: BLE001
         fsq, report["fsq_error"] = [], f"{type(exc).__name__}: {exc}"
     try:
+        ov, ov_release = overture_places(bbox)
+        report["overture_release"] = ov_release
+        open_ov = [p for p in ov if not p["closed"]]
+        report["overture_places_in_area"] = len(open_ov)
+        report["overture_halal_category_in_area"] = sum(p["halal_category"] for p in open_ov)
+        report["overture_halal_name_in_area"] = sum(p["halal_name"] for p in open_ov)
+        report["overture_halal_any_in_area"] = sum(p["halal_category"] or p["halal_name"] for p in open_ov)
+    except Exception as exc:  # noqa: BLE001
+        ov, report["overture_error"] = [], f"{type(exc).__name__}: {exc}"
+    try:
         osm = osm_places(bbox)
         report["osm_halal_in_area"] = len(osm)
     except Exception as exc:  # noqa: BLE001
@@ -176,12 +224,15 @@ def main():
     for p in sample:
         f = best_match(p, fsq)
         o = best_match(p, osm)
+        v = best_match(p, ov)
         rows.append({
             "name": p["name"], "city": p.get("city"), "evidence": p.get("evidence"),
             "fsq_found": bool(f), "fsq_name": f and f["name"], "fsq_categories": f and f["categories"],
             "fsq_marks_halal": bool(f and (f["halal_category"] or f["halal_name"])),
             "fsq_halal_category": bool(f and f["halal_category"]), "fsq_closed": f and f["closed"],
             "fsq_refreshed": f and f["refreshed"], "fsq_distance_m": f and f["_dist"],
+            "ov_found": bool(v), "ov_name": v and v["name"], "ov_marks_halal": bool(v and (v["halal_category"] or v["halal_name"])),
+            "ov_halal_category": bool(v and v["halal_category"]), "ov_categories": v and v["categories"], "ov_from": v and v["from"],
             "osm_found": bool(o), "osm_name": o and o["name"], "osm_distance_m": o and o["_dist"],
         })
     report["rows"] = rows
@@ -190,25 +241,32 @@ def main():
     report["fsq_marks_halal"] = sum(r["fsq_marks_halal"] for r in rows)
     report["fsq_halal_category"] = sum(r["fsq_halal_category"] for r in rows)
     report["osm_found"] = sum(r["osm_found"] for r in rows)
-    report["either_marks_halal"] = sum(r["fsq_marks_halal"] or r["osm_found"] for r in rows)
+    report["ov_found"] = sum(r["ov_found"] for r in rows)
+    report["ov_marks_halal"] = sum(r["ov_marks_halal"] for r in rows)
+    report["ov_halal_category"] = sum(r["ov_halal_category"] for r in rows)
+    report["either_marks_halal"] = sum(r["fsq_marks_halal"] or r["ov_marks_halal"] or r["osm_found"] for r in rows)
     json.dump(report, open(os.path.join(out_dir, "report.json"), "w"), indent=1, default=str)
 
     md = [f"# Halal Maps coverage check ({n} sample places)", ""]
-    for k in ["fsq_release", "fsq_error", "osm_error"]:
+    for k in ["fsq_release", "fsq_error", "overture_release", "overture_error", "osm_error"]:
         if k in report:
             md.append(f"- {k}: {report[k]}")
     md += [
         f"- In Foursquare at all: {report['fsq_found']}/{n}",
         f"- Foursquare marks halal (category or name): {report['fsq_marks_halal']}/{n} (category alone: {report['fsq_halal_category']})",
+        f"- In Overture at all: {report['ov_found']}/{n}",
+        f"- Overture marks halal (category or name): {report['ov_marks_halal']}/{n} (category alone: {report['ov_halal_category']})",
+        f"- Overture whole area: open places {report.get('overture_places_in_area')}, halal category {report.get('overture_halal_category_in_area')}, "
+        f"halal in name {report.get('overture_halal_name_in_area')}, either {report.get('overture_halal_any_in_area')}",
         f"- OpenStreetMap tagged halal: {report['osm_found']}/{n}",
         f"- Shown as halal by either: {report['either_marks_halal']}/{n}",
         f"- Whole area: Foursquare open places {report.get('fsq_places_in_area')}, halal category {report.get('fsq_halal_category_in_area')}, "
         f"halal in name {report.get('fsq_halal_name_in_area')}, either {report.get('fsq_halal_any_in_area')}; OSM halal-tagged {report.get('osm_halal_in_area')}",
-        "", "| Place | City | In FSQ | FSQ halal | FSQ categories | Closed | OSM halal |", "|---|---|---|---|---|---|---|",
+        "", "| Place | City | In Overture | Overture halal | Overture categories | Sources | OSM halal |", "|---|---|---|---|---|---|---|",
     ]
     for r in rows:
-        md.append(f"| {r['name'][:40]} | {r['city']} | {'yes' if r['fsq_found'] else 'no'} | {'yes' if r['fsq_marks_halal'] else 'no'} | "
-                  f"{', '.join(r['fsq_categories'] or [])[:80]} | {r['fsq_closed'] or ''} | {'yes' if r['osm_found'] else 'no'} |")
+        md.append(f"| {r['name'][:40]} | {r['city']} | {'yes' if r['ov_found'] else 'no'} | {'yes' if r['ov_marks_halal'] else 'no'} | "
+                  f"{', '.join(r['ov_categories'] or [])[:120]} | {r['ov_from'] or ''} | {'yes' if r['osm_found'] else 'no'} |")
     text = "\n".join(md)
     open(os.path.join(out_dir, "summary.md"), "w").write(text)
     if os.environ.get("GITHUB_STEP_SUMMARY"):
