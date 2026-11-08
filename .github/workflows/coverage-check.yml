@@ -1,0 +1,35 @@
+name: Halal Maps coverage check
+
+# Manual only. Counts how many known halal places in an area appear, and are
+# marked halal, in Foursquare Open Source Places and OpenStreetMap.
+on:
+  workflow_dispatch:
+    inputs:
+      sample:
+        description: "JSON list of {name, city, lat, lng, evidence}"
+        required: true
+      bbox:
+        description: "south,west,north,east"
+        required: true
+        default: "33.38,-118.13,33.95,-117.41"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install duckdb==1.1.3
+      - name: Run check
+        env:
+          SAMPLE: ${{ inputs.sample }}
+        run: |
+          printf '%s' "$SAMPLE" > sample.json
+          python scripts/coverage_check.py sample.json "${{ inputs.bbox }}" out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: out/
