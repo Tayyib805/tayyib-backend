@@ -69,14 +69,30 @@ def best_match(place: dict, candidates: list[dict]) -> dict | None:
     return best
 
 
-def latest_fsq_release() -> str:
-    url = f"https://{BUCKET}.s3.amazonaws.com/?list-type=2&prefix=release/dt%3D&delimiter=/"
-    xml = urllib.request.urlopen(url, timeout=60).read()
+def _list(prefix: str) -> tuple[list[str], list[str], str]:
+    url = f"https://{BUCKET}.s3.amazonaws.com/?list-type=2&prefix={urllib.parse.quote(prefix)}&delimiter=/"
+    body = urllib.request.urlopen(url, timeout=60).read()
+    root = ET.fromstring(body)
     ns = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
-    prefixes = [p.text for p in ET.fromstring(xml).findall(".//s3:CommonPrefixes/s3:Prefix", ns)]
-    if not prefixes:
-        raise RuntimeError("no releases listed")
-    return sorted(prefixes)[-1].rstrip("/")  # release/dt=YYYY-MM-DD
+    prefixes = [p.text for p in root.findall(".//s3:CommonPrefixes/s3:Prefix", ns)]
+    keys = [k.text for k in root.findall(".//s3:Contents/s3:Key", ns)]
+    return prefixes, keys, body[:400].decode("utf-8", "replace")
+
+
+def latest_fsq_release() -> str:
+    """Newest release folder, e.g. release/dt=2026-10-07."""
+    tried = []
+    for prefix in ["release/", ""]:
+        try:
+            prefixes, keys, head = _list(prefix)
+        except Exception as exc:  # noqa: BLE001
+            tried.append(f"{prefix!r}: {exc}")
+            continue
+        found = sorted({m.group(0) for p in prefixes + keys for m in [re.search(r"release/dt=\d{4}-\d{2}-\d{2}", p)] if m})
+        if found:
+            return found[-1]
+        tried.append(f"{prefix!r}: {prefixes[:5]} {keys[:5]} {head}")
+    raise RuntimeError("no releases listed; " + " | ".join(tried))
 
 
 def fsq_places(bbox: tuple[float, float, float, float]) -> tuple[list[dict], str]:
@@ -107,11 +123,22 @@ def fsq_places(bbox: tuple[float, float, float, float]) -> tuple[list[dict], str
 
 
 def osm_places(bbox) -> list[dict]:
+    import time
     s, w, n, e = bbox
     q = f'[out:json][timeout:120];nwr["diet:halal"~"yes|only"]({s},{w},{n},{e});out tags center;'
-    req = urllib.request.Request("https://overpass-api.de/api/interpreter", data=urllib.parse.urlencode({"data": q}).encode(),
-                                 headers={"User-Agent": "tayyib-coverage-check/1.0"})
-    data = json.load(urllib.request.urlopen(req, timeout=180))
+    data, errors = None, []
+    for server in ["https://overpass-api.de/api/interpreter", "https://overpass.kumi.systems/api/interpreter",
+                   "https://overpass.private.coffee/api/interpreter", "https://overpass-api.de/api/interpreter"]:
+        try:
+            req = urllib.request.Request(server, data=urllib.parse.urlencode({"data": q}).encode(),
+                                         headers={"User-Agent": "tayyib-coverage-check/1.0"})
+            data = json.load(urllib.request.urlopen(req, timeout=180))
+            break
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{server}: {exc}")
+            time.sleep(10)
+    if data is None:
+        raise RuntimeError("; ".join(errors))
     out = []
     for el in data.get("elements", []):
         t = el.get("tags", {})
