@@ -64,6 +64,10 @@ def area_items(con, path: str, cols: set[str], bbox: list[float]) -> list[dict]:
     items = []
     for pid, name, lat, lng, cats, prim, status, confidence, street, city, region, phone, website in rows:
         name, cats, prim = (name or "").strip(), (cats or "").lower(), (prim or "").lower()
+        if not prim:
+            # Newer releases keep the category under taxonomy/basic_category instead of categories.
+            found = re.search(r'"primary":"([^"]+)"', cats) or re.search(r'^\s*"?([a-z_]+)"?\s*$', cats)
+            prim = found.group(1) if found else ""
         if not name or (status and status != "open"):
             continue
         if confidence is not None and confidence < 0.5:

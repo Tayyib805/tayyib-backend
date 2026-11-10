@@ -8,7 +8,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
-from app.routers import articles, ingredients, inquiries, leaderboard, maintenance, products, push, refutes, restaurants, scans, spotchecks, users
+from app.routers import articles, ingredients, inquiries, leaderboard, maintenance, platform, products, push, refutes, restaurants, scans, spotchecks, users
 
 settings = get_settings()
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -57,6 +57,7 @@ app.include_router(articles.router, prefix="/articles", tags=["articles"])
 app.include_router(push.router, prefix="/push", tags=["push"])
 app.include_router(leaderboard.router, prefix="/leaderboard", tags=["leaderboard"])
 app.include_router(maintenance.router)
+app.include_router(platform.router, tags=["platform"])
 
 
 @app.get("/health")

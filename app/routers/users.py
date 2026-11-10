@@ -5,7 +5,9 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from supabase import Client
 
+from app.config import get_settings
 from app.services.article_text import clean_display_name
+from app.services.subscriptions import effective_tier
 from app.database import get_current_user, get_supabase
 from app.models.user import UserProfileUpdate
 from app.ratelimit import rate_limit
@@ -34,8 +36,43 @@ async def get_me(
             .insert({"id": user["id"]})
             .execute()
         )
-        return created.data[0] if created.data else {"id": user["id"]}
-    return response.data[0]
+        return _with_subscription(supabase, created.data[0] if created.data else {"id": user["id"]})
+    return _with_subscription(supabase, response.data[0])
+
+
+def _with_subscription(supabase: Client, profile: dict) -> dict:
+    """Add what the person is entitled to right now; tidy up a subscription that ran out."""
+
+    tier = effective_tier(profile)
+    if tier == "free" and (profile.get("subscription_tier") or "free") != "free":
+        # The paid period ended and no renewal arrived: record it.
+        try:
+            supabase.table("user_profiles").update({"subscription_tier": "free"}).eq("id", profile["id"]).execute()
+        except Exception:
+            pass
+        profile["subscription_tier"] = "free"
+    profile["subscription"] = {
+        "tier": tier,
+        "active": tier != "free",
+        "expires_at": profile.get("subscription_expires_at") if tier != "free" else None,
+        "store": profile.get("subscription_store") if tier != "free" else None,
+    }
+    return profile
+
+
+@router.post("/me/subscription/refresh", dependencies=[Depends(rate_limit("subscription_refresh", 10, 3600))])
+async def refresh_subscription(
+    user: dict = Depends(get_current_user),
+    supabase: Client = Depends(get_supabase),
+) -> dict:
+    """Ask RevenueCat for this account's current subscription (the app calls this right after a purchase)."""
+
+    from app.routers.platform import apply_subscription
+
+    if get_settings().REVENUECAT_API_KEY:
+        await apply_subscription(supabase, user["id"])
+    rows = supabase.table("user_profiles").select("*").eq("id", user["id"]).limit(1).execute().data
+    return _with_subscription(supabase, rows[0] if rows else {"id": user["id"]})["subscription"]
 
 
 @router.put("/me")

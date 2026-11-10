@@ -1,0 +1,50 @@
+name: API check
+
+# Manual. Calls the live API's public endpoints and prints what came back,
+# so a deploy can be checked from anywhere. Reads only; changes nothing.
+on:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Call the API
+        run: |
+          python - <<'PY'
+          import collections, json, os, time, urllib.error, urllib.request
+          BASE = "https://tayyib-backend.onrender.com"
+          lines = ["# API check", ""]
+          def get(path, timeout=120):
+              started = time.time()
+              try:
+                  with urllib.request.urlopen(BASE + path, timeout=timeout) as r:
+                      return r.status, json.load(r), time.time() - started
+              except urllib.error.HTTPError as e:
+                  return e.code, {"error": e.read().decode()[:300]}, time.time() - started
+              except Exception as e:
+                  return 0, {"error": str(e)}, time.time() - started
+          code, body, t = get("/")
+          lines.append(f"- `/` {code} in {t:.1f}s")
+          code, body, t = get("/config")
+          lines.append(f"- `/config` {code}: {json.dumps(body)[:400]}")
+          for label, lat, lng in [("Anaheim", 33.8353, -117.9145), ("Paterson NJ", 40.9168, -74.1718), ("Fullerton", 33.8704, -117.9242)]:
+              for attempt in range(4):
+                  code, body, t = get(f"/restaurants/nearby?lat={lat}&lng={lng}&radius_km=16")
+                  if body.get("osm") != "loading":
+                      break
+                  time.sleep(10)
+              items = body.get("items", [])
+              tiers = dict(collections.Counter(i.get("tier") for i in items))
+              lines.append(f"- nearby {label}: {code} in {t:.1f}s, osm={body.get('osm')}, {len(items)} places, tiers {tiers}")
+              for i in items[:5]:
+                  lines.append(f"    - {i['name']} · {i.get('distance_km')} km · {i.get('tier')} · {i.get('halal_level')}")
+          code, body, t = get("/restaurants/admin/review")
+          lines.append(f"- admin queue without signing in: {code} (expected 401)")
+          code, body, t = get("/leaderboard/scans?period=all")
+          lines.append(f"- leaderboard: {code}, {len(body.get('entries', []))} entries")
+          text = "\n".join(lines)
+          print(text)
+          open(os.environ["GITHUB_STEP_SUMMARY"], "a").write(text + "\n")
+          PY
