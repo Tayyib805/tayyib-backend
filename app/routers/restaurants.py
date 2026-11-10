@@ -154,7 +154,10 @@ def merge_cities(rows: list[dict]) -> list[dict]:
             home["lng"] = (home["lng"] * home["places"] + row["lng"] * int(row["places"])) / total
             home["places"] = total
         else:
-            merged.append({"city_key": row["city_key"], "city": row["city"], "region": row.get("region"),
+            city = row["city"]
+            # Sources sometimes shout ("PATERSON") or whisper; show it as a name.
+            city = city.title() if city.isupper() or city.islower() else city
+            merged.append({"city_key": row["city_key"], "city": city, "region": row.get("region"),
                            "places": int(row["places"]), "lat": float(row["lat"]), "lng": float(row["lng"])})
     merged.sort(key=lambda m: -m["places"])
     return [
