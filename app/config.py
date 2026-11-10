@@ -22,6 +22,8 @@ class Settings(BaseSettings):
     VAPID_PUBLIC_KEY: str = ""
     VAPID_PRIVATE_KEY: str = ""
     VAPID_SUBJECT: str = "mailto:verify@tayyib.app"
+    # Monthly open-data place files (built by .github/workflows/places-data.yml).
+    PLACES_DATA_URL: str = "https://raw.githubusercontent.com/Tayyib805/tayyib-backend/places-data"
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 

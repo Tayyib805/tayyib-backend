@@ -1,8 +1,9 @@
 """Fetch halal places to eat from OpenStreetMap via the Overpass API.
 
 The public Overpass servers ask for roughly 10,000 requests a day at most.
-Results are cached by ~1 km grid cell for 12 hours and calls are throttled,
-so normal app use stays far below that. Data is © OpenStreetMap contributors
+Places are stored in our database and an area is only re-read when someone
+opens the map there and its copy is over two weeks old, so normal app use
+stays far below that. Data is © OpenStreetMap contributors
 (ODbL) and must be credited wherever it is shown.
 """
 
@@ -16,6 +17,7 @@ from app.config import get_settings
 ENDPOINTS = (
     "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
 )
 CACHE_TTL_SECONDS = 12 * 60 * 60
 CACHE_MAX = 5_000
@@ -83,4 +85,37 @@ async def fetch_halal_food(lat: float, lng: float, radius_m: int) -> list[dict] 
                 _cache.clear()
             _cache[key] = (now, elements)
         return elements
+    return None
+
+
+BBOX_QUERY = """
+[out:json][timeout:40];
+nwr["amenity"~"^(restaurant|fast_food|cafe|food_court)$"]["diet:halal"~"^(yes|only)",i]({south},{west},{north},{east});
+out center tags 2000;
+"""
+
+
+async def fetch_halal_food_bbox(south: float, west: float, north: float, east: float) -> list[dict] | None:
+    """Raw Overpass elements inside a box, or None if OSM can't be reached now."""
+
+    import logging
+
+    log = logging.getLogger("tayyib.places")
+    if not _take_slot():
+        log.warning("Overpass skipped: over %s calls a minute", CALLS_PER_MINUTE)
+        return None
+    query = BBOX_QUERY.format(south=south, west=west, north=north, east=east)
+    headers = {"User-Agent": get_settings().OPEN_FOOD_FACTS_USER_AGENT}
+    for url in ENDPOINTS:
+        try:
+            async with httpx.AsyncClient(timeout=50) as client:
+                response = await client.post(url, data={"data": query}, headers=headers)
+            if response.status_code in (429, 503, 504):
+                log.warning("Overpass busy (%s) at %s", response.status_code, url)
+                continue
+            response.raise_for_status()
+            return response.json().get("elements") or []
+        except Exception as exc:
+            log.warning("Overpass failed at %s: %s", url, type(exc).__name__)
+            continue
     return None

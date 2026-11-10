@@ -182,3 +182,89 @@ def merge_places(
     merged = [p for p in merged if p["distance_km"] <= radius_km]
     merged.sort(key=lambda p: p["distance_km"])
     return merged[:limit]
+
+
+# ── Stored places ───────────────────────────────────────────────────────────
+
+KIND_LABELS = {
+    **FOOD_AMENITIES,
+    "food_truck": "Food truck",
+    "bakery": "Bakery",
+    "grocery": "Grocery",
+    "butcher": "Butcher",
+    "prayer_space": "Prayer space",
+}
+
+
+def osm_import_item(element: dict) -> dict | None:
+    """One Overpass element as an item for import_places(), or None if it shouldn't be listed."""
+
+    place = classify_osm(element, (0.0, 0.0))
+    if not place:
+        return None
+    tags = element.get("tags") or {}
+    cuisine = [c.strip().replace("_", " ") for c in re.split(r"[;,]", tags.get("cuisine") or "") if c.strip()]
+    item = {
+        "external_id": place["id"].split(":", 1)[1],
+        "name": place["name"],
+        "lat": place["lat"],
+        "lng": place["lng"],
+        "address": place["address"],
+        "city": tags.get("addr:city"),
+        "region": tags.get("addr:state"),
+        "phone": place["phone"],
+        "website": place["website"],
+        "cuisine": [c for c in cuisine if c.lower() not in {"halal", "regional"}][:4],
+        "kind": place["kind"],
+        "opening_hours": place["opening_hours"],
+        "halal": True,
+        "data": {"diet_halal": tags.get("diet:halal"), "certifier": place["certifier"]},
+    }
+    # "only" means the whole menu is halal; "yes" only says halal food is served.
+    if place["halal_level"] == "fully_halal":
+        item["halal_menu"] = "full"
+    return item
+
+
+def present_place(row: dict) -> dict:
+    """A stored place as the app shows it. Unknown stays unknown; nothing is assumed."""
+
+    menu = row.get("halal_menu") or "unknown"
+    cuisine = [c[:1].upper() + c[1:] for c in (row.get("cuisine") or []) if c][:3]
+    distance = row.get("distance_m")
+    return {
+        "id": row["id"],
+        "source": "tayyib",
+        "name": row.get("name"),
+        "lat": row.get("lat"),
+        "lng": row.get("lng"),
+        "distance_km": round(distance / 1000, 2) if distance is not None else None,
+        "kind": row.get("kind") or "restaurant",
+        "kind_label": KIND_LABELS.get(row.get("kind") or "restaurant", "Restaurant"),
+        "cuisine": ", ".join(cuisine) or None,
+        "halal_level": {"full": "fully_halal", "partial": "halal_options"}.get(menu, "halal"),
+        "certified": row.get("tier") == "certified",
+        "certifier": row.get("certifier"),
+        "certified_until": row.get("certified_until"),
+        "address": ", ".join(x for x in (row.get("address"), row.get("city")) if x) or None,
+        "phone": row.get("phone"),
+        "website": row.get("website"),
+        "opening_hours": row.get("opening_hours"),
+        "prayer_space": {"designated": True, "on_request": True, "none": False}.get(row.get("prayer") or "unknown"),
+        "avg_rating": None,
+        "review_count": 0,
+        # Evidence-based labels.
+        "tier": row.get("tier") or "listed",
+        "confidence": row.get("confidence") or 0,
+        "status": row.get("status") or "active",
+        "labels": {
+            "halal_menu": menu,
+            "slaughter": row.get("slaughter") or "unknown",
+            "alcohol": row.get("alcohol") or "unknown",
+            "pork": row.get("pork") or "unknown",
+            "prayer": row.get("prayer") or "unknown",
+        },
+        "disagreeing_people": row.get("disagreeing_people") or 0,
+        "closed_reports": row.get("closed_reports") or 0,
+        "last_confirmed_at": row.get("last_confirmed_at"),
+    }
