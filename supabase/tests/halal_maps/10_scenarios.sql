@@ -1,6 +1,6 @@
 \pset footer off
 \set QUIET on
-create or replace function t_place(n text, lat float8, lng float8) returns uuid language sql as $$ insert into places (name, location) values (n, st_makepoint(lng, lat)) returning id $$;
+create or replace function t_place(n text, lat float8, lng float8) returns uuid language sql as $$ insert into places (name, lat, lng) values (n, lat, lng) returning id $$;
 create or replace function t_src(p uuid, s text, ext text, sc text default 'US') returns void language sql as $$ insert into place_sources (place_id, source, external_id, scope) values (p, s, ext, sc) $$;
 create or replace function t_user(days int) returns uuid language sql as $$ insert into auth.users (created_at) values (now() - (days || ' days')::interval) returning id $$;
 create or replace function t_ev(p uuid, a text, v text, s text, ref text, age interval default '0', uid uuid default null) returns void language sql as $$
@@ -18,8 +18,8 @@ select t_user(1) as new3 \gset
 
 \echo '=== S1 Foursquare place in the Halal category, nothing else'
 select t_place('Al Amir Restaurant', 33.8353, -117.9145) as p1 \gset
-select t_src(:'p1', 'fsq', 'fsq1') \g /dev/null
-select t_ev(:'p1', 'halal', 'yes', 'fsq', 'fsq1') \g /dev/null
+select t_src(:'p1', 'overture', 'ov1') \g /dev/null
+select t_ev(:'p1', 'halal', 'yes', 'overture', 'ov1') \g /dev/null
 select * from t_show where name = 'Al Amir Restaurant';
 \echo '=== S2 also tagged in OSM'
 select t_src(:'p1', 'osm', 'node/1', 'cell1') \g /dev/null
@@ -39,8 +39,8 @@ select * from t_show where name = 'Al Amir Restaurant';
 
 \echo '=== S4a one established account reports "closed"'
 select t_place('Kabob Express', 33.8360, -117.9150) as p2 \gset
-select t_src(:'p2', 'fsq', 'fsq2') \g /dev/null
-select t_ev(:'p2', 'halal', 'yes', 'fsq', 'fsq2') \g /dev/null
+select t_src(:'p2', 'overture', 'ov2') \g /dev/null
+select t_ev(:'p2', 'halal', 'yes', 'overture', 'ov2') \g /dev/null
 select t_uev(:'p2', 'open', 'closed', :'vet1') \g /dev/null
 select * from t_show where name = 'Kabob Express';
 \echo '=== S4b a second account reports "closed"'
@@ -70,18 +70,18 @@ select t_ev(:'p5', 'halal', 'yes', 'osm', 'node/5', '18 months') \g /dev/null
 select * from t_show where name = 'Quiet Suburb Halal';
 \echo '=== S8 contradiction: menu "full" but halal net "no"'
 select t_place('Mixed Signals', 33.85, -117.93) as p6 \gset
-select t_src(:'p6', 'fsq', 'fsq6') \g /dev/null
+select t_src(:'p6', 'overture', 'ov6') \g /dev/null
 select t_uev(:'p6', 'halal_menu', 'full', :'vet3') \g /dev/null
 select t_uev(:'p6', 'halal', 'no', :'vet1') \g /dev/null
 select t_uev(:'p6', 'halal', 'no', :'vet2') \g /dev/null
-select t_ev(:'p6', 'halal', 'yes', 'fsq', 'fsq6') \g /dev/null
+select t_ev(:'p6', 'halal', 'yes', 'overture', 'ov6') \g /dev/null
 select * from t_show where name = 'Mixed Signals';
 
 \echo '=== S9 monthly re-import upserts; an admin-retracted claim stays retracted'
 update place_evidence set retracted_at = now() where place_id = :'p1' and source = 'osm';
 insert into place_evidence (place_id, attribute, value, source, source_ref) values (:'p1', 'halal', 'yes', 'osm', 'node/1')
   on conflict (place_id, attribute, source, source_ref) do update set observed_at = excluded.observed_at;
-select source, (retracted_at is not null) as still_retracted, observed_at > now() - interval '1 minute' as refreshed from place_evidence where place_id = :'p1' and source in ('osm', 'fsq') order by 1;
+select source, (retracted_at is not null) as still_retracted, observed_at > now() - interval '1 minute' as refreshed from place_evidence where place_id = :'p1' and source in ('osm', 'overture') order by 1;
 
 \echo '=== S10 bad certifier value is refused; a proper one certifies'
 \set ON_ERROR_STOP 0
@@ -101,7 +101,7 @@ select 'Kabob House flagged as possible duplicate of Kabob Express' as check, ex
 
 \echo '=== S12 an unverified "owner" vs a verified one'
 select t_place('Owner Test', 33.86, -117.94) as p7 \gset
-select t_src(:'p7', 'fsq', 'fsq7') \g /dev/null
+select t_src(:'p7', 'overture', 'ov7') \g /dev/null
 select t_ev(:'p7', 'halal', 'yes', 'owner', md5(:'vet3'), '0', :'vet3') \g /dev/null
 select 'unverified owner' as who, confidence from places where id = :'p7';
 insert into place_claims (place_id, user_id, method, verified_at) values (:'p7', :'vet3', 'phone_callback', now());
@@ -109,15 +109,15 @@ select refresh_place(:'p7') \g /dev/null
 select 'verified owner' as who, confidence from places where id = :'p7';
 
 \echo '=== S13 sync safety: a broken monthly feed, then healthy runs'
-insert into places (name, location) select 'Bulk ' || g, st_makepoint(-117.9 + g * 0.001, 33.9) from generate_series(1, 100) g;
-insert into place_sources (place_id, source, external_id, scope, last_seen_at) select id, 'fsq', 'bulk-' || id, 'CA', now() - interval '40 days' from places where name like 'Bulk %';
-insert into sync_runs (source, scope) values ('fsq', 'CA') returning id as run1 \gset
+insert into places (name, lat, lng) select 'Bulk ' || g, 33.9, -117.9 + g * 0.001 from generate_series(1, 100) g;
+insert into place_sources (place_id, source, external_id, scope, last_seen_at) select id, 'overture', 'bulk-' || id, 'CA', now() - interval '40 days' from places where name like 'Bulk %';
+insert into sync_runs (source, scope) values ('overture', 'CA') returning id as run1 \gset
 update place_sources set last_seen_at = now() where scope = 'CA' and external_id in (select 'bulk-' || id from places where name in ('Bulk 1','Bulk 2','Bulk 3'));
 select 'feed returned 3 of 100' as run, finish_sync_run(:'run1') as result, (select count(*) from places where name like 'Bulk %' and status <> 'active') as places_affected;
-insert into sync_runs (source, scope) values ('fsq', 'CA') returning id as run2 \gset
+insert into sync_runs (source, scope) values ('overture', 'CA') returning id as run2 \gset
 update place_sources set last_seen_at = now() where scope = 'CA' and external_id not in (select 'bulk-' || id from places where name = 'Bulk 50');
 select 'healthy run, 1 missing' as run, finish_sync_run(:'run2') as result, (select status from places where name = 'Bulk 50') as bulk_50;
-insert into sync_runs (source, scope) values ('fsq', 'CA') returning id as run3 \gset
+insert into sync_runs (source, scope) values ('overture', 'CA') returning id as run3 \gset
 update place_sources set last_seen_at = now() where scope = 'CA' and external_id not in (select 'bulk-' || id from places where name = 'Bulk 50');
 select 'second healthy run, still missing' as run, finish_sync_run(:'run3') as result, (select status from places where name = 'Bulk 50') as bulk_50;
 
