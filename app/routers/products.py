@@ -675,9 +675,9 @@ async def _scan_product(barcode: str, country_code: str, supabase: Client):
         return response
 
     off_product = await lookup_barcode(barcode, normalized_country)
-    if off_product.get("busy"):
-        # Our Open Food Facts budget is spent; the app fetches the record from
-        # the user's device and sends it to POST /scan/{barcode}/from-device.
+    if off_product.get("busy") or off_product.get("error"):
+        # Our Open Food Facts budget is spent (or we couldn't reach them); the app fetches the
+        # record from the user's device and sends it to POST /scan/{barcode}/from-device.
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             content={
@@ -731,9 +731,12 @@ async def scan_from_device(
 ) -> dict:
     """Analyze a product whose Open Food Facts record the app fetched itself.
 
-    Used only when our own lookups are busy. Records from devices are stored
-    as user submissions, never overwrite a product we already have for this
-    country, and are rate limited like scans.
+    The app does this when our own lookups are busy. A record sent by a device
+    could have been altered, so it is only used when we can't ask Open Food
+    Facts ourselves right now: if we can, our own lookup decides. Records that
+    are used are stored as user submissions (re-checked later from Review →
+    Tools), never overwrite a product we already have for this country, and
+    are rate limited like scans.
     """
 
     if not BARCODE_PATTERN.match(barcode):
@@ -744,22 +747,30 @@ async def scan_from_device(
         product = _increment_scan_count(supabase, existing, normalized_country)
         return _build_scan_response(supabase, product, normalized_country)
 
+    needs_label = JSONResponse(
+        status_code=status.HTTP_404_NOT_FOUND,
+        content={
+            "found": False,
+            "barcode": barcode,
+            "country_code": normalized_country,
+            "message": "Product not in database. Please scan the ingredients label.",
+            "requires_label_scan": True,
+        },
+    )
+    official = await lookup_barcode(barcode, normalized_country)
+    if official.get("found"):
+        return await _analyze_and_enrich_product(supabase, existing, official, barcode, normalized_country)
+    if not official.get("busy") and not official.get("error"):
+        # Open Food Facts answered us: it has no such product, so the device's record isn't theirs.
+        return needs_label
+
     record = payload.product or {}
     code = str(record.get("code") or barcode).lstrip("0")
     if code != barcode.lstrip("0"):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="That record is for a different barcode.")
     off_product = normalize_product(record, barcode, normalized_country)
     if not off_product["ingredients_text"] or off_product["name"] == "Unknown product":
-        return JSONResponse(
-            status_code=status.HTTP_404_NOT_FOUND,
-            content={
-                "found": False,
-                "barcode": barcode,
-                "country_code": normalized_country,
-                "message": "Product not in database. Please scan the ingredients label.",
-                "requires_label_scan": True,
-            },
-        )
+        return needs_label
     return await _analyze_and_enrich_product(
         supabase,
         existing,

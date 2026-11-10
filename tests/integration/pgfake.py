@@ -149,18 +149,46 @@ class Query:
 
     # ── run ──
     def _select_list(self) -> str:
-        if self.cols.strip() == "*":
-            return "t.*"
+        return self._columns("t", self.t, self.cols, 0)
+
+    def _has_column(self, table: str, column: str) -> bool:
+        cache = self.pg.__dict__.setdefault("_columns_seen", {})
+        if (table, column) not in cache:
+            cache[(table, column)] = bool(self.pg.run(
+                "select to_json(count(*)) from information_schema.columns "
+                f"where table_schema = 'public' and table_name = {lit(table)} and column_name = {lit(column)}"
+            ))
+        return cache[(table, column)]
+
+    def _columns(self, alias: str, table: str, cols: str, depth: int) -> str:
+        """A select list, with PostgREST-style embeds: parent(cols) via <parent>_id, or children(cols) via <this>_id."""
+
+        def singular(name: str) -> str:
+            return name[:-1] if name.endswith("s") else name
+
+        pieces, level, start = [], 0, 0
+        for i, ch in enumerate(cols):
+            level += ch == "("
+            level -= ch == ")"
+            if ch == "," and level == 0:
+                pieces.append(cols[start:i])
+                start = i + 1
+        pieces.append(cols[start:])
         parts = []
-        for col in re.split(r",(?![^()]*\))", self.cols):
-            col = col.strip()
-            m = re.match(r"^(\w+)\((.*)\)$", col)
-            if m:  # embedded many-to-one: places(name, city) via <singular>_id
+        for col in (c.strip() for c in pieces):
+            m = re.match(r"^(\w+)\((.*)\)$", col, re.S)
+            if m:
                 rel, inner = m.group(1), m.group(2)
-                fk = (rel[:-1] if rel.endswith("s") else rel) + "_id"
-                parts.append(f"(select row_to_json(x) from (select {inner} from public.{rel} r where r.id = t.{fk}) x) as {rel}")
+                a = f"e{depth}"
+                body = self._columns(a, rel, inner, depth + 1)
+                if self._has_column(table, singular(rel) + "_id"):  # many-to-one: places(name, city)
+                    parts.append(f"(select row_to_json(x) from (select {body} from public.{rel} {a} where {a}.id = {alias}.{singular(rel)}_id) x) as {rel}")
+                else:  # one-to-many: product_ingredients(*)
+                    parts.append(f"(select coalesce(json_agg(x), '[]'::json) from (select {body} from public.{rel} {a} where {a}.{singular(table)}_id = {alias}.id) x) as {rel}")
+            elif col == "*":
+                parts.append(f"{alias}.*")
             else:
-                parts.append(f"t.{col}")
+                parts.append(f"{alias}.{col}")
         return ", ".join(parts)
 
     def _where(self) -> str:

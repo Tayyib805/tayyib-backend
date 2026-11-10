@@ -156,7 +156,8 @@ async def lookup_barcode(barcode: str, country_code: str = "US") -> dict:
     except httpx.TimeoutException:
         return {**missing, "busy": True}
     except Exception:
-        return missing
+        # We couldn't ask; this is not Open Food Facts saying the product doesn't exist.
+        return {**missing, "error": True}
 
     if payload.get("status") != 1 or not payload.get("product"):
         if len(_misses) >= _MISS_MAX:
