@@ -308,6 +308,37 @@ def _require_admin(user: dict, supabase: Client) -> None:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required.")
 
 
+SOURCE_NAMES = {
+    "osm": "OpenStreetMap",
+    "overture": "Overture Maps",
+    "user": "A shopper",
+    "owner": "The owner",
+    "admin": "tayyib.",
+    "certifier": "A certifier",
+    "manufacturer": "The chain",
+}
+ANSWER_TEXT = {
+    ("halal", "yes"): "halal",
+    ("halal", "no"): "not halal",
+    ("halal_menu", "full"): "whole menu is halal",
+    ("halal_menu", "partial"): "some halal options",
+    ("halal_menu", "none"): "nothing halal on the menu",
+    ("alcohol", "yes"): "serves alcohol",
+    ("alcohol", "no"): "no alcohol",
+    ("slaughter", "hand"): "hand-slaughtered meat",
+    ("slaughter", "machine"): "machine-slaughtered meat",
+    ("slaughter", "mixed"): "hand and machine-slaughtered meat",
+    ("pork", "yes"): "pork on the menu",
+    ("pork", "no"): "no pork",
+    ("prayer", "designated"): "has a prayer space",
+    ("prayer", "on_request"): "prayer space on request",
+    ("prayer", "none"): "no prayer space",
+    ("open", "yes"): "open",
+    ("open", "closed"): "closed down",
+    ("certified", "yes"): "certified",
+    ("certified", "revoked"): "certificate withdrawn",
+}
+
 PLACE_FIELDS = "id,name,kind,lat,lng,address,city,phone,website,cuisine,status,tier,confidence,halal_menu,alcohol,slaughter,disagreeing_people,closed_reports,last_confirmed_at,created_at"
 
 
@@ -357,16 +388,17 @@ async def admin_review(
     notes: dict[str, list[str]] = {}
     if context_ids:
         for s in supabase.table("place_sources").select("place_id,source,data").in_("place_id", context_ids).execute().data or []:
-            label = s["source"]
+            label = SOURCE_NAMES.get(s["source"], s["source"])
             categories = (s.get("data") or {}).get("categories")
             if categories:
-                label += f" ({categories})"
+                label += f" ({str(categories).replace('_', ' ')})"
             sources.setdefault(s["place_id"], []).append(label)
         for e in (
             supabase.table("place_evidence").select("place_id,attribute,value,source,note").in_("place_id", context_ids).is_("retracted_at", "null").execute().data
             or []
         ):
-            text = f"{e['source']}: {e['attribute']} {e['value']}" + (f" — {e['note']}" if e.get("note") else "")
+            said = ANSWER_TEXT.get((e["attribute"], e["value"]), f"{e['attribute']} {e['value']}")
+            text = f"{SOURCE_NAMES.get(e['source'], e['source'])}: {said}" + (f" — {e['note']}" if e.get("note") else "")
             notes.setdefault(e["place_id"], []).append(text)
     for p in candidates + disputed:
         p["sources"] = sources.get(p["id"], [])

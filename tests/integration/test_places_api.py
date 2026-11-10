@@ -159,7 +159,7 @@ def test_admin_sorts_imported_candidates_and_handles_flags_and_duplicates(pg, ap
     assert result["added"] >= 3
     queue = run(r.admin_review(lat=OC[0], lng=OC[1], user=admin, supabase=pg))
     zaytoon = next(c for c in queue["candidates"] if c["name"] == "Zaytoon Kitchen")
-    assert any("middle_eastern" in s for s in zaytoon["sources"])
+    assert zaytoon["sources"] == ["Overture Maps (middle eastern restaurant)"]
     assert queue["counts"]["candidates"] >= 2
 
     run(r.decide_place(zaytoon["id"], r.PlaceDecision(decision="halal_full", alcohol="no"), user=admin, supabase=pg))
