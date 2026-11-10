@@ -16,6 +16,7 @@ from app.services.claude_analysis import analyze_ingredients, describe_error, ex
 from app.ratelimit import rate_limit
 from app.services.alternatives import build_alternatives, category_chain, category_label
 from app.services.openfoodfacts import lookup_barcode, normalize_product, search_halal_labeled
+from app.services.rulings import apply_madhab, build_index
 from app.services.trust import vote_counts, why_not_counted
 from app.services.label_qc import (
     CONFIRMATIONS_NEEDED,
@@ -215,6 +216,37 @@ def _build_scan_response(
         "verified_source": product.get("verified_source"),
         "manufacturer_confirmed": _maker_note(supabase, product),
     }
+
+
+_rulings_cache: dict = {"at": 0.0, "index": None}
+RULINGS_CACHE_SECONDS = 300
+
+
+def rulings_index(supabase: Client, fresh: bool = False) -> dict:
+    """Catalogued ingredients and their current madhab rulings (cached a few minutes)."""
+
+    if not fresh and _rulings_cache["index"] is not None and time.monotonic() - _rulings_cache["at"] < RULINGS_CACHE_SECONDS:
+        return _rulings_cache["index"]
+    ingredients = supabase.table("ingredients").select("id,name,e_number,common_aliases").execute().data or []
+    current = (
+        supabase.table("ingredient_rulings").select("ingredient_id,madhab,status,reasoning,source,source_url,superseded_at")
+        .is_("superseded_at", "null").execute().data
+        or []
+    )
+    _rulings_cache.update({"at": time.monotonic(), "index": build_index(ingredients, current)})
+    return _rulings_cache["index"]
+
+
+def for_madhab(supabase: Client, response, madhab: str | None):
+    """A scan response adjusted for the person's school, when sourced rulings exist. Never fails a scan."""
+
+    if not madhab or not isinstance(response, dict) or madhab.strip().lower() in ("", "general"):
+        return response
+    try:
+        return apply_madhab(response, madhab, rulings_index(supabase))
+    except Exception as exc:
+        logging.getLogger("tayyib.rulings").warning("Madhab rulings skipped: %s", exc)
+        return response
 
 
 def _maker_note(supabase: Client, product: dict) -> dict | None:
@@ -617,8 +649,15 @@ async def _analyze_and_enrich_product(
 async def scan_product(
     barcode: str,
     country_code: str = "US",
+    madhab: str | None = Query(default=None, max_length=12),
     supabase: Client = Depends(get_supabase),
-) -> dict:
+):
+    """Scan a barcode. With ?madhab=, sourced rulings for that school are applied on top of the general verdict."""
+
+    return for_madhab(supabase, await _scan_product(barcode, country_code, supabase), madhab)
+
+
+async def _scan_product(barcode: str, country_code: str, supabase: Client):
     """Scan a barcode, preferring Tayyib data before enriching from Open Food Facts."""
 
     if not BARCODE_PATTERN.match(barcode):
@@ -1105,6 +1144,7 @@ async def get_halal_alternatives(
 async def get_product_verdict(
     product_id: str,
     country_code: str = "US",
+    madhab: str | None = Query(default=None, max_length=12),
     supabase: Client = Depends(get_supabase),
 ) -> dict:
     """A stored product in the same shape a scan returns, for reopening results.
@@ -1115,7 +1155,7 @@ async def get_product_verdict(
     product = _fetch_product_with_ingredients(supabase, "id", product_id)
     if not product:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found.")
-    return _build_scan_response(supabase, product, _normalize_country_code(country_code))
+    return for_madhab(supabase, _build_scan_response(supabase, product, _normalize_country_code(country_code)), madhab)
 
 
 @router.get("/{product_id}")
