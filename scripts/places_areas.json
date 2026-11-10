@@ -1,0 +1,7 @@
+{
+  "note": "Areas whose places are refreshed monthly from Overture Maps. Add an area here to seed it; keep boxes to a metro area.",
+  "areas": [
+    {"scope": "us-ca-orange-county", "label": "Orange County, CA", "bbox": [33.38, -118.13, 33.95, -117.41]},
+    {"scope": "us-nj-north", "label": "North Jersey", "bbox": [40.48, -74.50, 41.05, -73.90]}
+  ]
+}
