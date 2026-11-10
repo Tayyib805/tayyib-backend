@@ -114,6 +114,9 @@ def main() -> None:
     summary = [f"# Halal Maps open data ({index['release']})", "", "| Area | Marked halal | Candidates to sort |", "|---|---|---|"]
     for area in areas:
         items = area_items(con, path, cols, area["bbox"])
+        if area.get("regions"):
+            wanted = {r.upper() for r in area["regions"]}
+            items = [i for i in items if (i.get("region") or "").upper() in wanted]
         marked = sum(i["halal"] for i in items)
         if not items:
             raise SystemExit(f"{area['scope']}: no places found; refusing to publish an empty file")
