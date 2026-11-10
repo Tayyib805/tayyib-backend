@@ -44,6 +44,19 @@ jobs:
           lines.append(f"- admin queue without signing in: {code} (expected 401)")
           code, body, t = get("/leaderboard/scans?period=all")
           lines.append(f"- leaderboard: {code}, {len(body.get('entries', []))} entries")
+          # The app looks a barcode up from the shopper's device when the server's budget is spent:
+          # that only works if Open Food Facts allows requests from web pages (CORS).
+          def cors(label, url, origin="https://tayyib.app"):
+              try:
+                  req = urllib.request.Request(url, headers={"Origin": origin, "User-Agent": "tayyib-api-check/1.0"})
+                  with urllib.request.urlopen(req, timeout=60) as r:
+                      lines.append(f"- {label}: {r.status}, Access-Control-Allow-Origin = {r.headers.get('Access-Control-Allow-Origin')!r}")
+              except urllib.error.HTTPError as e:
+                  lines.append(f"- {label}: {e.code}, Access-Control-Allow-Origin = {e.headers.get('Access-Control-Allow-Origin')!r}")
+              except Exception as e:
+                  lines.append(f"- {label}: failed ({e})")
+          cors("Open Food Facts from a web page", "https://world.openfoodfacts.org/api/v2/product/737628064502.json?fields=code,product_name&app_name=tayyib")
+          cors("our API from another website", BASE + "/config", origin="https://example.org")
           text = "\n".join(lines)
           print(text)
           open(os.environ["GITHUB_STEP_SUMMARY"], "a").write(text + "\n")
