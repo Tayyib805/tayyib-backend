@@ -1,0 +1,68 @@
+{
+ "source": "overture",
+ "release": "2026-10-21.0",
+ "generated_at": "2026-11-10T06:06:14+00:00",
+ "areas": [
+  {
+   "scope": "us-ca-orange-county",
+   "label": "Orange County, CA",
+   "source": "overture",
+   "file": "us-ca-orange-county.json",
+   "generated_at": "2026-11-10T06:06:14+00:00",
+   "count": 201,
+   "marked_halal": 44,
+   "bbox": [
+    33.38,
+    -118.13,
+    33.95,
+    -117.41
+   ]
+  },
+  {
+   "scope": "us-nj-north",
+   "label": "North Jersey",
+   "source": "overture",
+   "file": "us-nj-north.json",
+   "generated_at": "2026-11-10T06:06:14+00:00",
+   "count": 477,
+   "marked_halal": 162,
+   "bbox": [
+    40.48,
+    -74.5,
+    41.05,
+    -73.9
+   ]
+  },
+  {
+   "scope": "north-america",
+   "label": "United States and Canada",
+   "source": "overture",
+   "file": "north-america.json",
+   "generated_at": "2026-11-10T06:06:14+00:00",
+   "count": 2610,
+   "marked_halal": 2610,
+   "bbox": [
+    18.8,
+    -170.0,
+    71.6,
+    -52.0
+   ]
+  },
+  {
+   "scope": "north-america",
+   "label": "United States and Canada",
+   "source": "osm",
+   "file": "osm-north-america.json",
+   "generated_at": "2026-11-10T06:06:14+00:00",
+   "count": 1579,
+   "marked_halal": 1579,
+   "bbox": [
+    18.8,
+    -170.0,
+    71.6,
+    -52.0
+   ]
+  }
+ ],
+ "attribution": "Overture Maps Foundation, overturemaps.org; OpenStreetMap contributors, openstreetmap.org/copyright"
+}
