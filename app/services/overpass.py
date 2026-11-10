@@ -89,7 +89,7 @@ async def fetch_halal_food(lat: float, lng: float, radius_m: int) -> list[dict] 
 
 
 BBOX_QUERY = """
-[out:json][timeout:40];
+[out:json][timeout:20];
 nwr["amenity"~"^(restaurant|fast_food|cafe|food_court)$"]["diet:halal"~"^(yes|only)",i]({south},{west},{north},{east});
 out center tags 2000;
 """
@@ -108,7 +108,7 @@ async def fetch_halal_food_bbox(south: float, west: float, north: float, east: f
     headers = {"User-Agent": get_settings().OPEN_FOOD_FACTS_USER_AGENT}
     for url in ENDPOINTS:
         try:
-            async with httpx.AsyncClient(timeout=50) as client:
+            async with httpx.AsyncClient(timeout=25) as client:
                 response = await client.post(url, data={"data": query}, headers=headers)
             if response.status_code in (429, 503, 504):
                 log.warning("Overpass busy (%s) at %s", response.status_code, url)

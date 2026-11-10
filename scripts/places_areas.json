@@ -1,7 +1,11 @@
 {
-  "note": "Areas whose places are refreshed monthly from Overture Maps. Add an area here to seed it; keep boxes to a metro area. regions keeps only places whose address is in those states (a box around North Jersey also covers New York City).",
+  "note": "What the monthly Halal Maps job publishes (see places_data.py). Boxes are [south, west, north, east]. 'areas' come from Overture Maps: a metro area lists places marked halal plus often-halal cuisines as candidates for a person to sort; an area with marked_only lists only places marked halal, so it can be as large as a continent. regions keeps places whose address is in those states (a box around North Jersey also covers New York City); countries does the same by country code. 'osm' boxes are read from OpenStreetMap (diet:halal tags) once a month. The API treats any point inside an imported box as covered and never waits on a live map service there. To add a country: add its box to both lists.",
   "areas": [
     {"scope": "us-ca-orange-county", "label": "Orange County, CA", "bbox": [33.38, -118.13, 33.95, -117.41], "regions": ["CA"]},
-    {"scope": "us-nj-north", "label": "North Jersey", "bbox": [40.48, -74.50, 41.05, -73.90], "regions": ["NJ"]}
+    {"scope": "us-nj-north", "label": "North Jersey", "bbox": [40.48, -74.50, 41.05, -73.90], "regions": ["NJ"]},
+    {"scope": "north-america", "label": "United States and Canada", "bbox": [18.8, -170.0, 71.6, -52.0], "countries": ["US", "CA"], "marked_only": true}
+  ],
+  "osm": [
+    {"scope": "north-america", "label": "United States and Canada", "bbox": [18.8, -170.0, 71.6, -52.0]}
   ]
 }

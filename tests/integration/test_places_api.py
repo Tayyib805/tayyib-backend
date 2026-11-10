@@ -20,6 +20,12 @@ def api(pg, monkeypatch):
 
     places_store._running.clear()
     places_store._last_attempt.clear()
+    places_store._imported.clear()
+    places_store._imported_checked = None
+    places_store._osm_failures = 0
+    places_store._osm_last_failure = None
+    # Tests choose their own covered boxes; by default nothing is covered and squares use the live service.
+    monkeypatch.setattr(places_store, "configured_boxes", lambda: [])
     state = {"elements": [], "calls": 0}
 
     async def fake_fetch(south, west, north, east):
@@ -215,7 +221,7 @@ def test_monthly_open_data_imports_once_and_refuses_a_gutted_file(pg, api, monke
 
     monkeypatch.setattr(places_store, "_get_json", fake_get)
     first = run(places_store.import_open_data(pg, "https://example.test/data"))
-    assert first == [{"scope": "test-area", "items": 30, "added": 30, "matched": 0, "seen": 0, "outcome": "ok"}]
+    assert first == [{"source": "overture", "scope": "test-area", "items": 30, "added": 30, "matched": 0, "seen": 0, "outcome": "ok"}]
     counts = pg.run("select json_object_agg(status, n) from (select status, count(*) n from public.places where name like 'Open Data Grill %' group by 1) t")
     assert counts == {"active": 15, "candidate": 15}
 
@@ -227,3 +233,75 @@ def test_monthly_open_data_imports_once_and_refuses_a_gutted_file(pg, api, monke
     assert again[0]["outcome"] == "suspect" and again[0]["seen"] == 5
     missing = pg.run("select to_json(count(*)) from public.place_sources where scope = 'test-area' and missing_runs > 0")
     assert missing == 0
+
+
+def test_inside_an_imported_box_the_map_never_waits_on_the_live_service(pg, api, monkeypatch):
+    from app.services import places_store
+
+    r, state = api
+    state["elements"] = None  # the live service is down
+    monkeypatch.setattr(places_store, "configured_boxes", lambda: [("overture", "box-a", (50.0, 50.0, 52.0, 52.0))])
+
+    # Configured but not imported yet: the square still falls back to the live service.
+    before = run(r.nearby_places(lat=51.0, lng=51.0, radius_km=8, supabase=pg))
+    assert before["osm"] == "unavailable" and state["calls"] == 1
+
+    pg.run("with x as (insert into public.sync_runs (source, scope, status, finished_at) values ('overture', 'box-a', 'ok', now()) returning 1) select to_json(count(*)) from x")
+    places_store._imported_checked = None
+    out = run(r.nearby_places(lat=51.4, lng=51.4, radius_km=8, supabase=pg))
+    assert out["items"] == [] and out["osm"] == "ok", "an empty covered square is simply empty"
+    assert state["calls"] == 1, "nothing live is read inside a covered box"
+    outside = run(r.nearby_places(lat=53.0, lng=51.0, radius_km=8, supabase=pg))
+    assert outside["osm"] == "unavailable" and state["calls"] == 2, "just outside the box the live service is still used"
+
+
+def test_after_repeated_failures_new_areas_answer_at_once(pg, api):
+    from datetime import timedelta
+
+    from app.services import places_store
+
+    r, state = api
+    state["elements"] = None
+    for i in range(3):
+        out = run(r.nearby_places(lat=-20.0 - i, lng=20.0, radius_km=8, supabase=pg))
+        assert out["osm"] == "unavailable"
+    assert state["calls"] == 3 and places_store.osm_struggling()
+
+    out = run(r.nearby_places(lat=-30.0, lng=20.0, radius_km=8, supabase=pg))
+    assert out["osm"] == "unavailable" and state["calls"] == 3, "no new read, and no waiting, while the service is struggling"
+
+    # Half an hour without a failure: try again, and a working service clears the streak.
+    places_store._osm_last_failure -= timedelta(minutes=31)
+    state["elements"] = [element(900, "Cape Kabob", -31.0, 20.0)]
+    out = run(r.nearby_places(lat=-31.0, lng=20.0, radius_km=8, supabase=pg))
+    assert names(out) == ["Cape Kabob"] and out["osm"] == "ok" and not places_store.osm_struggling()
+    assert places_store._osm_failures == 0
+
+
+def test_monthly_files_from_both_sources_land_on_one_place(pg, api, monkeypatch):
+    from app.services import places_store
+
+    stamp = "2026-11-05T09:00:00+00:00"
+    files = {
+        "index.json": {"source": "overture", "areas": [
+            {"scope": "box-b", "source": "overture", "file": "box-b.json", "generated_at": stamp},
+            {"scope": "box-b", "source": "osm", "file": "osm-box-b.json", "generated_at": stamp},
+            {"scope": "box-b", "source": "somewhere-else", "file": "x.json", "generated_at": stamp},
+        ]},
+        "box-b.json": {"items": [{"external_id": "ovt-1", "name": "Twin Source Grill", "lat": 45.0, "lng": -93.0, "halal": True}]},
+        "osm-box-b.json": {"items": [
+            {"external_id": "node/77", "name": "Twin Source Grill", "lat": 45.0001, "lng": -93.0001, "halal": True, "halal_menu": "full"},
+            {"external_id": "node/78", "name": "Only On OpenStreetMap Cafe", "lat": 45.01, "lng": -93.0, "halal": True},
+        ]},
+    }
+
+    async def fake_get(url):
+        return files[url.rsplit("/", 1)[1]]
+
+    monkeypatch.setattr(places_store, "_get_json", fake_get)
+    out = run(places_store.import_open_data(pg, "https://example.test/data"))
+    assert [(o["source"], o["outcome"], o["added"], o["matched"]) for o in out] == [("overture", "ok", 1, 0), ("osm", "ok", 1, 1)]
+    row = pg.run("select row_to_json(t) from (select p.halal_menu, p.tier, (select json_agg(s.source order by s.source) from public.place_sources s where s.place_id = p.id) sources "
+                 "from public.places p where p.name = 'Twin Source Grill') t")
+    assert row == {"halal_menu": "full", "tier": "listed", "sources": ["osm", "overture"]}
+    assert ("osm", "box-b") in places_store._imported and ("overture", "box-b") in places_store._imported

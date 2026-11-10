@@ -1,8 +1,14 @@
-"""Keep stored places in step with OpenStreetMap, one map square at a time.
+"""Keep stored places up to date. The map always answers from the database.
 
-The map always answers from the database. Opening the map in a square whose
-OpenStreetMap copy is missing or over two weeks old re-reads that square in
-the background (inline the very first time, so a new area isn't empty).
+Two feeders, by where the viewer is:
+
+- Covered boxes (scripts/places_areas.json, e.g. the US and Canada): a monthly
+  job publishes place files (Overture Maps and OpenStreetMap's halal tags) and
+  this module imports them. Nothing live is needed, so the map never waits.
+- Everywhere else: the map square being viewed is read from OpenStreetMap's
+  live Overpass service when its copy is missing or over two weeks old. That
+  service is often unreachable from a hosted server, so this is best effort:
+  after a few failures in a row we stop making viewers wait for it.
 
 Squares are 0.2° (about 22 km). A read covers the square plus a margin, so
 people near an edge still see their surroundings. Each place belongs to the
@@ -13,9 +19,11 @@ missing, and it takes two healthy reads in a row (see finish_sync_run).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import datetime, timedelta, timezone
 from math import floor
+from pathlib import Path
 
 from supabase import Client
 
@@ -29,9 +37,20 @@ MARGIN_DEG = 0.25
 STALE_AFTER = timedelta(days=14)
 RETRY_AFTER = timedelta(minutes=10)
 
+# The live service is "struggling" after this many failed reads in a row, for this long after the latest one.
+OSM_STRUGGLING_AFTER = 3
+OSM_STRUGGLING_FOR = timedelta(minutes=30)
+AREAS_FILE = Path(__file__).resolve().parents[2] / "scripts" / "places_areas.json"
+OPEN_SOURCES = ("overture", "osm")
+
 _running: set[str] = set()
 _background: set[asyncio.Task] = set()
 _last_attempt: dict[str, datetime] = {}
+_osm_failures = 0
+_osm_last_failure: datetime | None = None
+_boxes: list[tuple[str, str, tuple[float, float, float, float]]] | None = None
+_imported: set[tuple[str, str]] = set()
+_imported_checked: datetime | None = None
 
 
 def cell_of(lat: float, lng: float) -> str:
@@ -73,9 +92,83 @@ def note_view(supabase: Client, cell: str) -> dict | None:
     return None
 
 
+def osm_struggling() -> bool:
+    """True while the live OpenStreetMap service keeps failing; viewers shouldn't be made to wait for it."""
+
+    return (
+        _osm_failures >= OSM_STRUGGLING_AFTER
+        and _osm_last_failure is not None
+        and _now() - _osm_last_failure < OSM_STRUGGLING_FOR
+    )
+
+
+def _note_osm(ok: bool) -> None:
+    global _osm_failures, _osm_last_failure
+    if ok:
+        _osm_failures = 0
+    else:
+        _osm_failures += 1
+        _osm_last_failure = _now()
+
+
 def can_attempt(cell: str) -> bool:
+    if cell in _running:
+        return False
+    if osm_struggling():
+        # One probe every few minutes across all squares, instead of one per square.
+        newest = max(_last_attempt.values(), default=None)
+        if newest is not None and _now() - newest < RETRY_AFTER:
+            return False
     last = _last_attempt.get(cell)
-    return cell not in _running and (last is None or _now() - last > RETRY_AFTER)
+    return last is None or _now() - last > RETRY_AFTER
+
+
+# ── Coverage: where the monthly files already hold the places ───────────────
+
+
+def configured_boxes() -> list[tuple[str, str, tuple[float, float, float, float]]]:
+    """(source, scope, (south, west, north, east)) for every box the monthly job publishes."""
+
+    global _boxes
+    if _boxes is None:
+        try:
+            config = json.loads(AREAS_FILE.read_text())
+            _boxes = [("overture", a["scope"], tuple(a["bbox"])) for a in config.get("areas") or []]
+            _boxes += [("osm", a["scope"], tuple(a["bbox"])) for a in config.get("osm") or []]
+        except Exception as exc:  # no file: nothing is covered and every square uses the live service
+            log.warning("places_areas.json unreadable: %s", type(exc).__name__)
+            _boxes = []
+    return _boxes
+
+
+def covered(supabase: Client, lat: float, lng: float) -> bool:
+    """True when an imported monthly file covers this point, so no live read is needed here."""
+
+    global _imported_checked
+    inside = {(source, scope) for source, scope, (s, w, n, e) in configured_boxes() if s <= lat <= n and w <= lng <= e}
+    if not inside:
+        return False
+    if inside & _imported:
+        return True
+    if _imported_checked is not None and _now() - _imported_checked < timedelta(minutes=5):
+        return False
+    _imported_checked = _now()
+    try:
+        scopes = sorted({scope for _, scope, _ in configured_boxes()})
+        rows = (
+            supabase.table("sync_runs").select("source,scope").in_("source", list(OPEN_SOURCES))
+            .in_("scope", scopes).eq("status", "ok").limit(1000).execute().data or []
+        )
+        _imported.update((r["source"], r["scope"]) for r in rows)
+    except Exception as exc:
+        log.warning("coverage check failed: %s", type(exc).__name__)
+    return bool(inside & _imported)
+
+
+async def _rpc(supabase: Client, name: str, params: dict):
+    """Run a database function off the event loop: imports take a while and the API must keep answering."""
+
+    return await asyncio.to_thread(lambda: supabase.rpc(name, params).execute().data)
 
 
 async def sync_cell(supabase: Client, cell: str) -> bool:
@@ -91,6 +184,7 @@ async def sync_cell(supabase: Client, cell: str) -> bool:
         run = supabase.table("sync_runs").insert({"source": "osm", "scope": cell}).execute().data
         run_id = run[0]["id"] if run else None
         elements = await fetch_halal_food_bbox(south - MARGIN_DEG, west - MARGIN_DEG, north + MARGIN_DEG, east + MARGIN_DEG)
+        _note_osm(elements is not None)
         if elements is None:
             if run_id:
                 supabase.table("sync_runs").update(
@@ -106,9 +200,9 @@ async def sync_cell(supabase: Client, cell: str) -> bool:
         totals = {"added": 0, "matched": 0, "seen": 0}
         for scope, items in by_cell.items():
             for start in range(0, len(items), 200):
-                result = supabase.rpc(
-                    "import_places", {"items": items[start : start + 200], "p_source": "osm", "p_scope": scope}
-                ).execute().data or {}
+                result = await _rpc(
+                    supabase, "import_places", {"items": items[start : start + 200], "p_source": "osm", "p_scope": scope}
+                ) or {}
                 for key in totals:
                     totals[key] += int(result.get(key) or 0)
 
@@ -117,7 +211,7 @@ async def sync_cell(supabase: Client, cell: str) -> bool:
             supabase.table("sync_runs").update(
                 {"seen": sum(len(v) for v in by_cell.values()), "added": totals["added"], "updated": totals["seen"] + totals["matched"]}
             ).eq("id", run_id).execute()
-            outcome = supabase.rpc("finish_sync_run", {"run": run_id}).execute().data or "ok"
+            outcome = await _rpc(supabase, "finish_sync_run", {"run": run_id}) or "ok"
         supabase.table("map_cells").upsert(
             {"cell": cell, "last_synced_at": _now().isoformat(), "place_count": len(by_cell.get(cell, []))},
             on_conflict="cell",
@@ -150,12 +244,13 @@ def sync_in_background(supabase: Client, cell: str) -> asyncio.Task:
     return task
 
 
-# ── Monthly open data (Overture Maps) ───────────────────────────────────────
+# ── Monthly open data (Overture Maps and OpenStreetMap) ─────────────────────
 # A GitHub Actions job rebuilds one file per area each month and publishes
-# them on the places-data branch. We look for newer files a few times a day
-# and import them; finish_sync_run() refuses a file that suddenly lost a lot.
+# them on the places-data branch. We look for newer files about once an hour
+# (when someone opens the map) and import them; finish_sync_run() refuses a
+# file that suddenly lost a lot.
 
-OPEN_DATA_CHECK_EVERY = timedelta(hours=6)
+OPEN_DATA_CHECK_EVERY = timedelta(hours=1)
 _open_data_checked: datetime | None = None
 _open_data_running = False
 
@@ -191,16 +286,18 @@ async def import_open_data(supabase: Client, base_url: str) -> list[dict]:
     results: list[dict] = []
     try:
         index = await _get_json(f"{base_url.rstrip('/')}/index.json")
-        source = index.get("source") or "overture"
         for area in index.get("areas") or []:
+            source = area.get("source") or index.get("source") or "overture"
             scope, generated = area.get("scope"), _parse(area.get("generated_at"))
-            if not scope or not area.get("file") or generated is None:
+            if source not in OPEN_SOURCES or not scope or not area.get("file") or generated is None:
                 continue
             last = (
-                supabase.table("sync_runs").select("started_at").eq("source", source).eq("scope", scope)
+                supabase.table("sync_runs").select("started_at,status").eq("source", source).eq("scope", scope)
                 .in_("status", ["ok", "suspect"]).order("started_at", desc=True).limit(1).execute().data
             )
             if last and (_parse(last[0]["started_at"]) or generated) >= generated:
+                if last[0].get("status") == "ok":
+                    _imported.add((source, scope))
                 continue
             run = supabase.table("sync_runs").insert({"source": source, "scope": scope}).execute().data
             run_id = run[0]["id"]
@@ -208,21 +305,23 @@ async def import_open_data(supabase: Client, base_url: str) -> list[dict]:
                 items = (await _get_json(f"{base_url.rstrip('/')}/{area['file']}")).get("items") or []
                 totals = {"added": 0, "matched": 0, "seen": 0}
                 for start in range(0, len(items), 200):
-                    out = supabase.rpc("import_places", {"items": items[start : start + 200], "p_source": source, "p_scope": scope}).execute().data or {}
+                    out = await _rpc(supabase, "import_places", {"items": items[start : start + 200], "p_source": source, "p_scope": scope}) or {}
                     for key in totals:
                         totals[key] += int(out.get(key) or 0)
                 supabase.table("sync_runs").update(
                     {"seen": len(items), "added": totals["added"], "updated": totals["seen"] + totals["matched"]}
                 ).eq("id", run_id).execute()
-                outcome = supabase.rpc("finish_sync_run", {"run": run_id}).execute().data or "ok"
-                results.append({"scope": scope, "items": len(items), **totals, "outcome": outcome})
-                log.info("Open data %s: %s items, %s (%s)", scope, len(items), totals, outcome)
+                outcome = await _rpc(supabase, "finish_sync_run", {"run": run_id}) or "ok"
+                if outcome == "ok":
+                    _imported.add((source, scope))
+                results.append({"source": source, "scope": scope, "items": len(items), **totals, "outcome": outcome})
+                log.info("Open data %s %s: %s items, %s (%s)", source, scope, len(items), totals, outcome)
             except Exception as exc:
                 supabase.table("sync_runs").update(
                     {"status": "failed", "finished_at": _now().isoformat(), "error": type(exc).__name__}
                 ).eq("id", run_id).execute()
-                results.append({"scope": scope, "outcome": "failed", "error": type(exc).__name__})
-                log.warning("Open data %s failed: %s", scope, exc)
+                results.append({"source": source, "scope": scope, "outcome": "failed", "error": type(exc).__name__})
+                log.warning("Open data %s %s failed: %s", source, scope, exc)
     except Exception as exc:
         log.warning("Open data check failed: %s", exc)
     finally:

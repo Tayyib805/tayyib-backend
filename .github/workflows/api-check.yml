@@ -29,7 +29,7 @@ jobs:
           lines.append(f"- `/` {code} in {t:.1f}s")
           code, body, t = get("/config")
           lines.append(f"- `/config` {code}: {json.dumps(body)[:400]}")
-          for label, lat, lng in [("Anaheim", 33.8353, -117.9145), ("Paterson NJ", 40.9168, -74.1718), ("Fullerton", 33.8704, -117.9242)]:
+          for label, lat, lng in [("Anaheim", 33.8353, -117.9145), ("Paterson NJ", 40.9168, -74.1718), ("Chicago", 41.9979, -87.6903), ("Dearborn MI", 42.3223, -83.1763), ("Houston", 29.7174, -95.4962), ("Toronto", 43.6532, -79.3832), ("Rural Nevada (covered, empty)", 39.5, -116.5), ("London (not covered)", 51.5155, -0.0722)]:
               for attempt in range(4):
                   code, body, t = get(f"/restaurants/nearby?lat={lat}&lng={lng}&radius_km=16")
                   if body.get("osm") != "loading":

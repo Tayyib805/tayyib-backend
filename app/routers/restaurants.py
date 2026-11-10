@@ -80,9 +80,10 @@ async def nearby_places(
 ) -> dict:
     """Stored halal places near a point, best-evidenced first.
 
-    Answers from the database. If this map square has never been read from
-    OpenStreetMap, it is read now (once); if its copy is over two weeks old,
-    it is refreshed in the background.
+    Answers from the database. Inside a box the monthly place files cover (the
+    US and Canada today) that is all: nothing live is read. Elsewhere, a map
+    square that has never been read from OpenStreetMap is read now (once), and
+    one whose copy is over two weeks old is refreshed in the background.
     """
 
     def read() -> list[dict]:
@@ -97,16 +98,18 @@ async def nearby_places(
     cell_row = places_store.note_view(supabase, cell)
     osm = "ok"
     items = read()
-    if places_store.needs_sync(cell_row):
+    if not places_store.covered(supabase, lat, lng) and places_store.needs_sync(cell_row):
         never_synced = not (cell_row or {}).get("last_synced_at")
+        # While the live service keeps failing, don't make anyone wait for it.
+        wait = not places_store.osm_struggling()
         task = places_store.sync_in_background(supabase, cell) if places_store.can_attempt(cell) else None
         if never_synced and not items:
             # A brand-new area: give the first read a few seconds so the map isn't empty.
-            if task is not None:
+            if task is not None and wait:
                 await asyncio.wait({task}, timeout=FIRST_READ_WAIT_SECONDS)
             if task is not None and task.done() and not task.cancelled() and task.exception() is None and task.result():
                 items = read()
-            elif places_store.is_running(cell):
+            elif wait and places_store.is_running(cell):
                 osm = "loading"
             else:
                 osm = "unavailable"
