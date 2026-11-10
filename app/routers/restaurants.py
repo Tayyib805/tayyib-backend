@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import unicodedata
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -115,6 +116,52 @@ async def nearby_places(
                 osm = "unavailable"
     items.sort(key=lambda p: p["distance_km"] if p["distance_km"] is not None else 1e9)
     return {"items": items, "radius_km": radius_km, "osm": osm, "attribution": ATTRIBUTION}
+
+
+@router.get("/cities", dependencies=[Depends(rate_limit("place_cities", 60, 60))])
+async def place_cities(q: str = Query(min_length=2, max_length=60), supabase: Client = Depends(get_supabase)) -> dict:
+    """Cities with places on the map whose name starts with q, biggest first.
+
+    For people who don't share their location or want to look at another city.
+    Built from our own places, so no outside address lookup is involved.
+    """
+
+    text = unicodedata.normalize("NFKD", " ".join(q.split())).encode("ascii", "ignore").decode().lower()
+    text = text.replace("\\", "").replace("%", "").replace("_", " ").strip()
+    if len(text) < 2:
+        return {"items": []}
+    rows = (
+        supabase.table("place_cities").select("city_key,city,region,places,lat,lng")
+        .ilike("city_key", f"{text}%").order("places", desc=True).limit(40).execute().data or []
+    )
+    return {"items": merge_cities(rows)[:8]}
+
+
+def merge_cities(rows: list[dict]) -> list[dict]:
+    """Fold "Chicago" (no state recorded) into "Chicago, IL" when they are the same place on the map."""
+
+    merged: list[dict] = []
+    for row in sorted(rows, key=lambda r: (r.get("region") is None, -int(r.get("places") or 0))):
+        home = None
+        if row.get("region") is None:
+            home = next(
+                (m for m in merged if m["city_key"] == row["city_key"] and abs(m["lat"] - row["lat"]) < 0.6 and abs(m["lng"] - row["lng"]) < 0.6),
+                None,
+            )
+        if home:
+            total = home["places"] + int(row["places"])
+            home["lat"] = (home["lat"] * home["places"] + row["lat"] * int(row["places"])) / total
+            home["lng"] = (home["lng"] * home["places"] + row["lng"] * int(row["places"])) / total
+            home["places"] = total
+        else:
+            merged.append({"city_key": row["city_key"], "city": row["city"], "region": row.get("region"),
+                           "places": int(row["places"]), "lat": float(row["lat"]), "lng": float(row["lng"])})
+    merged.sort(key=lambda m: -m["places"])
+    return [
+        {"city": m["city"], "region": m["region"], "label": ", ".join(x for x in (m["city"], m["region"]) if x),
+         "places": m["places"], "lat": round(m["lat"], 5), "lng": round(m["lng"], 5)}
+        for m in merged
+    ]
 
 
 # ── What shoppers tell us ────────────────────────────────────────────────

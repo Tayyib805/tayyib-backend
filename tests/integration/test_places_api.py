@@ -305,3 +305,31 @@ def test_monthly_files_from_both_sources_land_on_one_place(pg, api, monkeypatch)
                  "from public.places p where p.name = 'Twin Source Grill') t")
     assert row == {"halal_menu": "full", "tier": "listed", "sources": ["osm", "overture"]}
     assert ("osm", "box-b") in places_store._imported and ("overture", "box-b") in places_store._imported
+
+
+def test_cities_can_be_searched_for_people_without_location(pg, api):
+    r, _ = api
+    rows = [
+        ("Lakeside Kabob", "Testville", "IL", 41.90, -87.70, "active"),
+        ("Lakeside Grill", "Testville", "IL", 41.92, -87.66, "active"),
+        ("Lakeside Cafe", "testville", None, 41.91, -87.68, "active"),       # no state recorded, same city
+        ("Other Testville Diner", "Testville", "MO", 37.20, -93.30, "active"),  # a different Testville
+        ("Hidden Testville Spot", "Testville", "IL", 41.90, -87.70, "candidate"),  # not on the map: not counted
+        ("Testing Tandoor", "Testington", "ON", 43.70, -79.40, "possibly_closed"),
+        ("Bistro Halal", "Téstréal", "QC", 45.52, -73.63, "active"),
+    ]
+    values = ", ".join(f"('{n}', '{c}', {'null' if g is None else repr(g)}, {la}, {lo}, '{st}')" for n, c, g, la, lo, st in rows)
+    pg.run(f"with x as (insert into public.places (name, city, region, lat, lng, status) values {values} returning 1) select to_json(count(*)) from x")
+
+    out = run(r.place_cities(q="  testv ", supabase=pg))["items"]
+    assert [(c["label"], c["places"]) for c in out] == [("Testville, IL", 3), ("Testville, MO", 1)]
+    assert abs(out[0]["lat"] - 41.91) < 0.01 and abs(out[0]["lng"] + 87.68) < 0.01
+    assert [c["label"] for c in run(r.place_cities(q="test", supabase=pg))["items"]][:1] == ["Testville, IL"]
+    assert {c["label"] for c in run(r.place_cities(q="test", supabase=pg))["items"]} == {"Testville, IL", "Testington, ON", "Testville, MO", "Téstréal, QC"}
+    assert [c["label"] for c in run(r.place_cities(q="Testreal", supabase=pg))["items"]] == ["Téstréal, QC"], "accents don't matter"
+    assert [c["label"] for c in run(r.place_cities(q="téstré", supabase=pg))["items"]] == ["Téstréal, QC"]
+    assert run(r.place_cities(q="%%", supabase=pg))["items"] == []
+    assert run(r.place_cities(q="zzzz", supabase=pg))["items"] == []
+
+    near = run(r.nearby_places(lat=out[0]["lat"], lng=out[0]["lng"], radius_km=8, supabase=pg))
+    assert {"Lakeside Kabob", "Lakeside Grill", "Lakeside Cafe"} <= set(names(near))

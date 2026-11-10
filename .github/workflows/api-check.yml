@@ -40,6 +40,9 @@ jobs:
               lines.append(f"- nearby {label}: {code} in {t:.1f}s, osm={body.get('osm')}, {len(items)} places, tiers {tiers}")
               for i in items[:5]:
                   lines.append(f"    - {i['name']} · {i.get('distance_km')} km · {i.get('tier')} · {i.get('halal_level')}")
+          for text in ("chic", "montreal", "pater"):
+              code, body, t = get(f"/restaurants/cities?q={text}")
+              lines.append(f"- cities starting with '{text}': {code}, " + "; ".join(f"{c['label']} ({c['places']})" for c in body.get("items", [])[:4]))
           code, body, t = get("/restaurants/admin/review")
           lines.append(f"- admin queue without signing in: {code} (expected 401)")
           code, body, t = get("/leaderboard/scans?period=all")
