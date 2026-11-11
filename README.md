@@ -41,6 +41,25 @@ Authenticated endpoints expect:
 Authorization: Bearer <supabase-user-jwt>
 ```
 
+## Which design the app shows
+
+The app ships with two designs in the same build. `GET /config` tells every
+phone which one to draw, from one setting on the server:
+
+| `APP_DESIGN` | What everyone sees |
+| --- | --- |
+| `new` (default) | The new design |
+| `classic` | The original design |
+
+To go back to the original design, set `APP_DESIGN=classic` in the service's
+Environment on Render and save. Render restarts the service, and each phone
+picks up the change the next time the app is opened. No new app build is
+needed, and nothing is deleted: set it back to `new` to return.
+
+To look at either design on one device without changing it for anyone else,
+add `?design=classic` or `?design=new` to the app's address (`?design=auto`
+follows the server again). Admins also have this choice in Profile, Appearance.
+
 ## Scrapers
 
 Install the scraper browser dependency after installing Python packages:

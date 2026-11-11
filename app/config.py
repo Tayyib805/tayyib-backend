@@ -28,6 +28,10 @@ class Settings(BaseSettings):
     MAP_TILE_URL: str = ""
     MAP_TILE_URL_DARK: str = ""
     MAP_TILE_ATTRIBUTION: str = ""
+    # Which design the app shows everyone: "new" or "classic". Both ship in the same
+    # app build, so changing this takes effect the next time each phone opens the app.
+    # To go back to the original look, set APP_DESIGN=classic.
+    APP_DESIGN: str = "new"
     # Show "Sign in with Apple" once the provider is set up in Supabase Auth.
     APPLE_SIGN_IN_ENABLED: bool = False
     # Subscriptions (RevenueCat). The webhook is refused until REVENUECAT_WEBHOOK_AUTH is set.
@@ -43,6 +47,16 @@ class Settings(BaseSettings):
     PLACES_DATA_URL: str = "https://raw.githubusercontent.com/Tayyib805/tayyib-backend/places-data"
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+
+
+DESIGNS = ("new", "classic")
+
+
+def design_version(value: str | None) -> str:
+    """The design to serve. Anything we don't recognise (a typo, an empty value) falls back to the default."""
+
+    wanted = (value or "").strip().lower()
+    return wanted if wanted in DESIGNS else DESIGNS[0]
 
 
 @lru_cache

@@ -9,7 +9,7 @@ import re
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from supabase import Client
 
-from app.config import get_settings
+from app.config import design_version, get_settings
 from app.database import get_supabase
 from app.services import subscriptions as subs
 
@@ -30,6 +30,7 @@ async def app_config() -> dict:
             "tile_url_dark": s.MAP_TILE_URL_DARK or None,
             "attribution": s.MAP_TILE_ATTRIBUTION or None,
         },
+        "design": {"version": design_version(getattr(s, "APP_DESIGN", None))},
         "sign_in": {"apple": bool(s.APPLE_SIGN_IN_ENABLED)},
         "subscriptions": {
             "open": bool(s.SUBSCRIPTIONS_OPEN),
